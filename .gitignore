@@ -1,0 +1,16 @@
+# Секреты и состояние — никогда не попадают в Git
+.env
+*.session
+*.session-journal
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/

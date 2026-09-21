@@ -1,0 +1,6 @@
+# Telegram MTProto (чтение сообщений от имени вашего аккаунта)
+Telethon==1.45.0
+# HTTP-клиент для Telegram Bot API (отправка результата)
+aiohttp==3.14.3
+# Загрузка настроек из .env
+python-dotenv==1.2.3

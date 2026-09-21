@@ -1,0 +1,66 @@
+# Telegram message filter — systemd unit
+#
+# Установка:
+#   sudo cp systemd/telegram-filter.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now telegram-filter.service
+#
+# ВАЖНО: пути ниже рассчитаны на установку в /home/pi/WorkSpace/Programming/Python/app_store_monitor_filtered.
+# Если проект лежит в другом месте — поправьте WorkingDirectory, ExecStart,
+# EnvironmentFile и ReadWritePaths. Проверьте реальный путь к python:
+#   ls -l /home/pi/WorkSpace/Programming/Python/app_store_monitor_filtered/.venv/bin/python
+# Никогда не ставьте сюда /usr/bin/python3 — в системном Python нет Telethon.
+
+[Unit]
+Description=Telegram Message Filter (Telethon user-client -> Bot API)
+Documentation=file:///home/pi/WorkSpace/Programming/Python/app_store_monitor_filtered/README.md
+After=network-online.target
+Wants=network-online.target
+# Не уходить в бесконечный цикл перезапусков при ошибке конфигурации
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/WorkSpace/Programming/Python/app_store_monitor_filtered
+
+# Приложение и так читает .env через python-dotenv. Эта строка — дополнительный
+# способ передать переменные; дефис в начале означает «не падать, если файла нет».
+# Учтите: systemd разбирает файл строже, чем dotenv (не поддерживает `export`
+# и комментарии в конце строки).
+EnvironmentFile=-/home/pi/WorkSpace/Programming/Python/app_store_monitor_filtered/.env
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/home/pi/WorkSpace/Programming/Python/app_store_monitor_filtered/.venv/bin/python -m app.main
+
+Restart=always
+RestartSec=10
+# Код 78 = непоправимая ошибка (неверный .env, сессия бота, плохой токен).
+# Перезапуск её не вылечит, а 5 бессмысленных попыток упирались в
+# StartLimitBurst, после чего systemd отказывался стартовать сервис вообще
+# («Start request repeated too quickly») до ручного reset-failed.
+RestartPreventExitStatus=78
+# SIGTERM обрабатывается приложением: закрываются Telethon, HTTP и SQLite
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Логи -> journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=telegram-filter
+
+# Минимальное усиление безопасности
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# Каталог приложения должен оставаться доступным на запись:
+# там лежат .session и SQLite-база
+ReadWritePaths=/home/pi/WorkSpace/Programming/Python/app_store_monitor_filtered
+
+[Install]
+WantedBy=multi-user.target
