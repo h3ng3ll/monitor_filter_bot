@@ -127,6 +127,9 @@ class Config:
     startup_probe: bool          # False = ничего не отправлять при запуске
     startup_probe_limit: int     # сколько последних сообщений просмотреть
 
+    # --- Команды бота ---
+    bot_commands: bool           # False = не опрашивать getUpdates, /info не работает
+
     # --- Хранилище обработанных сообщений ---
     db_path: Path
     db_retention_days: int  # 0 = не чистить
@@ -196,6 +199,8 @@ def load_config(env_file: Optional[Path] = None) -> Config:
                 f"  Паттерн: {regex_raw}"
             ) from exc
 
+    bot_commands = _get_bool("BOT_COMMANDS", True)
+
     startup_probe = _get_bool("STARTUP_PROBE", True)
     startup_probe_limit = _get_int("STARTUP_PROBE_LIMIT", 50, minimum=1)
 
@@ -230,6 +235,7 @@ def load_config(env_file: Optional[Path] = None) -> Config:
         max_length=max_length,
         startup_probe=startup_probe,
         startup_probe_limit=startup_probe_limit,
+        bot_commands=bot_commands,
         db_path=db_path,
         db_retention_days=_get_int("DB_RETENTION_DAYS", 30, minimum=0),
         log_level=log_level,

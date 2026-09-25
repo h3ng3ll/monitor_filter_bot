@@ -5,7 +5,8 @@
 
 Модуль отвечает за:
   * форматирование уведомления (:func:`format_message`) в безопасный HTML;
-  * HTTP-запрос к api.telegram.org с retry/backoff и обработкой 429.
+  * HTTP-запрос к api.telegram.org с retry/backoff и обработкой 429;
+  * приём апдейтов (getUpdates) для команд бота — см. bot_commands.py.
 """
 
 from __future__ import annotations
@@ -55,7 +56,6 @@ def format_message(
     reason: Optional[str] = None,
     link: Optional[str] = None,
     header: str = "🚨 ВАЖНОЕ СООБЩЕНИЕ",
-    extra_fields: Sequence[Tuple[str, str]] = (),
     max_length: int = TELEGRAM_MAX_TEXT,
 ) -> str:
     """Собирает готовое HTML-уведомление.
@@ -75,10 +75,6 @@ def format_message(
     ]
     if reason:
         head_lines.append(f"<b>Причина:</b> {escape_html(reason)}")
-    # extra_fields попадают внутрь head, поэтому автоматически учитываются
-    # в body_budget ниже — сообщение не может вылезти за лимит Telegram.
-    for label, value in extra_fields:
-        head_lines.append(f"<b>{escape_html(label)}:</b> {escape_html(value)}")
     head_lines.append("")
     head_lines.append("<b>Текст:</b>")
 
@@ -215,9 +211,53 @@ class BotSender:
             log.error("Bot API недоступен после всех попыток: %s", exc)
             return False
 
+    # -- приём апдейтов ---------------------------------------------------- #
+
+    async def get_updates(self, offset: Optional[int], timeout: int) -> Any:
+        """Long polling getUpdates. Возвращает список апдейтов.
+
+        Слушаем только ``message`` — остальные типы апдейтов Telegram не
+        присылает, а значит и не копит их в очереди.
+        HTTP-таймаут берём с запасом над long poll, иначе aiohttp оборвёт
+        соединение раньше, чем Telegram ответит.
+        """
+        payload: Dict[str, Any] = {
+            "timeout": timeout,
+            "allowed_updates": ["message"],
+        }
+        if offset is not None:
+            payload["offset"] = offset
+        return await self._call(
+            "getUpdates", payload, http_timeout=timeout + self.timeout.total
+        )
+
+    async def set_my_commands(self, commands: Sequence[Tuple[str, str]]) -> None:
+        """Регистрирует меню команд, чтобы /info был виден в интерфейсе.
+
+        Не критично: при ошибке только пишем в лог — бот остаётся рабочим.
+        """
+        try:
+            await self._call(
+                "setMyCommands",
+                {"commands": [
+                    {"command": name, "description": text}
+                    for name, text in commands
+                ]},
+            )
+            log.info("Меню команд обновлено: %s",
+                     ", ".join("/" + name for name, _ in commands))
+        except (BotApiError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            log.warning("Не удалось обновить меню команд: %s", exc)
+
     # -- транспорт --------------------------------------------------------- #
 
-    async def _call(self, method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    async def _call(
+        self,
+        method: str,
+        payload: Dict[str, Any],
+        *,
+        http_timeout: Optional[float] = None,
+    ) -> Any:
         """HTTP-вызов метода Bot API с retry/backoff.
 
         Повторяем: сетевые ошибки, таймауты, 5xx и 429 (по retry_after).
@@ -233,7 +273,15 @@ class BotSender:
         while attempt <= self.max_retries:
             attempt += 1
             try:
-                async with self._session.post(url, json=payload) as response:
+                async with self._session.post(
+                    url,
+                    json=payload,
+                    timeout=(
+                        aiohttp.ClientTimeout(total=http_timeout)
+                        if http_timeout is not None
+                        else self.timeout
+                    ),
+                ) as response:
                     # Ответ Telegram всегда JSON, но при сбое прокси может прийти HTML.
                     try:
                         data = await response.json(content_type=None)

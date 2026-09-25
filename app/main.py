@@ -24,11 +24,13 @@ import asyncio
 import logging
 import signal
 import sys
+from datetime import datetime, timezone
 from typing import Optional
 
 from telethon import events, utils
 from telethon import errors as tg_errors
 
+from .bot_commands import CommandListener
 from .bot_sender import BotApiError, BotSender, format_message, format_status
 from .config import Config, ConfigError, load_config
 from .filter import MessageFilter
@@ -91,10 +93,17 @@ class Application:
             max_flood_wait=config.flood_wait_max_seconds,
         )
         self.client = create_client(config)
+        self.commands = CommandListener(
+            self.sender, allowed_chat_id=config.target_chat_id
+        )
+        self.commands.register("info", self._cmd_info)
+        self.commands.register("start", self._cmd_start)
         self.stop_event = asyncio.Event()
         self.source_entity = None
         self.source_id: Optional[int] = None
         self.source_label: str = config.source_label
+        self.started_at = datetime.now(timezone.utc)
+        self.account: str = "неизвестен"
 
     # -- запуск / остановка ------------------------------------------------ #
 
@@ -108,6 +117,7 @@ class Application:
 
             await self.sender.start()
             await ensure_authorized(self.client, allow_interactive=False)
+            self.account = await self._describe_account()
 
             self.source_entity = await resolve_source(self.client, self.config.source)
             self.source_id = utils.get_peer_id(self.source_entity)
@@ -122,9 +132,26 @@ class Application:
 
             await self._send_startup_probe()
 
-            await run_until_stopped(
-                self.client, self.stop_event, max_delay=self.config.reconnect_max_delay
-            )
+            listener: Optional[asyncio.Future] = None
+            if self.config.bot_commands:
+                await self.sender.set_my_commands(
+                    [("info", "Настройки и состояние сервиса")]
+                )
+                listener = asyncio.ensure_future(self.commands.run(self.stop_event))
+            else:
+                log.info("Команды бота отключены (BOT_COMMANDS=false)")
+
+            try:
+                await run_until_stopped(
+                    self.client,
+                    self.stop_event,
+                    max_delay=self.config.reconnect_max_delay,
+                )
+            finally:
+                if listener is not None:
+                    listener.cancel()
+                    # Ждём завершения, чтобы не оставить висящий запрос к Bot API.
+                    await asyncio.gather(listener, return_exceptions=True)
             return 0
         finally:
             await self.shutdown()
@@ -173,6 +200,50 @@ class Application:
         except Exception:  # noqa: BLE001
             pass
 
+    # -- команды бота ------------------------------------------------------- #
+
+    async def _describe_account(self) -> str:
+        """Имя и id аккаунта Telethon — главный признак верной настройки."""
+        try:
+            me = await self.client.get_me()
+        except Exception as exc:  # noqa: BLE001 - не повод падать
+            log.warning("Не удалось получить аккаунт: %s", exc)
+            return "неизвестен"
+        return f"{utils.get_display_name(me) or 'unknown'} (id={getattr(me, 'id', '?')})"
+
+    async def _cmd_info(self) -> str:
+        """Ответ на /info: настройки и состояние сервиса."""
+        probe = (
+            f"включена ({self.config.startup_probe_limit} сообщений)"
+            if self.config.startup_probe else "выключена"
+        )
+        try:
+            processed = str(await self.store.count())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Не удалось прочитать счётчик журнала: %s", exc)
+            processed = "неизвестно"
+
+        return format_status(
+            header="ℹ️ СОСТОЯНИЕ СЕРВИСА",
+            fields=[
+                ("Аккаунт", self.account),
+                ("Источник", self.source_label),
+                ("Правила", self.filter.describe()),
+                ("Целевой чат", str(self.config.target_chat_id)),
+                ("Самопроверка при старте", probe),
+                ("Переслано сообщений", processed),
+                ("Работает", _format_uptime(datetime.now(timezone.utc) - self.started_at)),
+            ],
+        )
+
+    async def _cmd_start(self) -> str:
+        return format_status(
+            header="👋 Фильтр App Store Monitor",
+            fields=[("Источник", self.source_label)],
+            note="Сюда приходят только сообщения, подходящие под правила. "
+                 "/info — показать настройки и состояние.",
+        )
+
     # -- самопроверка при старте -------------------------------------------- #
 
     async def _send_startup_probe(self) -> None:
@@ -183,6 +254,7 @@ class Application:
         Историю не помечаем обработанной: это не пересылка, а диагностика,
         и старое сообщение повторно как NewMessage всё равно не придёт.
 
+        Настройки в уведомление не подмешиваем — они доступны по /info.
         Ошибки здесь никогда не роняют сервис: мониторинг важнее самопроверки.
         """
         if not self.config.startup_probe:
@@ -190,22 +262,6 @@ class Application:
             return
 
         limit = self.config.startup_probe_limit
-
-        try:
-            me = await self.client.get_me()
-            account = (
-                f"{utils.get_display_name(me) or 'unknown'} "
-                f"(id={getattr(me, 'id', '?')})"
-            )
-        except Exception as exc:  # noqa: BLE001 - диагностика не критична
-            log.warning("Startup probe: не удалось получить аккаунт: %s", exc)
-            account = "неизвестен"
-
-        settings = [
-            ("Аккаунт", account),
-            ("Правила", self.filter.describe()),
-            ("Целевой чат", str(self.config.target_chat_id)),
-        ]
 
         try:
             found = await self._find_last_match(limit)
@@ -223,9 +279,9 @@ class Application:
                         type(exc).__name__, exc)
             payload = format_status(
                 header="⚠️ СЕРВИС ЗАПУЩЕН — история недоступна",
-                fields=[("Источник", self.source_label)] + settings,
-                note=f"Прочитать историю не удалось: {exc}. "
-                     f"Мониторинг новых сообщений при этом работает.",
+                fields=[("Источник", self.source_label)],
+                note=f"Прочитать историю не удалось: {exc}. Мониторинг новых "
+                     f"сообщений при этом работает. /info — настройки.",
             )
             await self._send_probe_payload(payload)
             return
@@ -233,12 +289,12 @@ class Application:
         if found is None:
             payload = format_status(
                 header="⚙️ СЕРВИС ЗАПУЩЕН — совпадений нет",
-                fields=[("Источник", self.source_label)]
-                       + settings
-                       + [("Просмотрено", f"последние {limit} сообщений")],
+                fields=[
+                    ("Источник", self.source_label),
+                    ("Просмотрено", f"последние {limit} сообщений"),
+                ],
                 note="Ни одно из последних сообщений источника не подходит под "
-                     "правила. Если это неожиданно — проверьте FILTER_KEYWORDS "
-                     "и FILTER_EXCLUDE_KEYWORDS.",
+                     "правила. Если это неожиданно — посмотрите /info.",
             )
         else:
             message, result = found
@@ -255,7 +311,6 @@ class Application:
                 text=message.raw_text or "",
                 reason=result.reason,
                 link=link,
-                extra_fields=settings,
             )
 
         await self._send_probe_payload(payload)
@@ -359,6 +414,24 @@ class Application:
 
         await self.store.mark_processed(chat_id, message.id)
         log.info("Message %s forwarded successfully", message.id)
+
+
+def _format_uptime(delta) -> str:
+    """'2 д 3 ч 4 мин' — без секунд, они в /info не нужны."""
+    total = int(delta.total_seconds())
+    if total < 60:
+        return "меньше минуты"
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    parts = []
+    if days:
+        parts.append(f"{days} д")
+    if hours:
+        parts.append(f"{hours} ч")
+    if minutes:
+        parts.append(f"{minutes} мин")
+    return " ".join(parts)
 
 
 # --------------------------------------------------------------------------- #
