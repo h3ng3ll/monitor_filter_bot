@@ -8,6 +8,7 @@
 
 import asyncio
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -317,3 +318,439 @@ def test_owner_button_press_is_accepted(tmp_path):
     }))
 
     assert _run(app.users.get(7)).status == STATUS_APPROVED
+
+
+# --------------------------------------------------------------------------- #
+# Возврат доступа — обратное к отзыву
+# --------------------------------------------------------------------------- #
+
+def test_revoke_then_unblock_returns_user_to_mailing(tmp_path):
+    app = _app(tmp_path)
+    _join(app, 7)
+    _run(app.handlers.cmd_revoke(_admin("7")))
+    assert 7 not in _recipient_ids(app)
+
+    reply = _run(app.handlers.cmd_unblock(_admin("7")))
+
+    assert "возвращён" in reply.lower()
+    assert _run(app.users.get(7)).status == STATUS_APPROVED
+    assert 7 in _recipient_ids(app)
+    assert any("восстановлен" in t for t in app.sender.texts_to(7))
+
+
+def test_unblock_clears_the_blocked_flag(tmp_path):
+    app = _app(tmp_path)
+    _join(app, 7)
+    # Так сервис помечает того, кто заблокировал бота.
+    _run(app.users.set_blocked(7, True))
+    assert 7 not in _recipient_ids(app)
+
+    reply = _run(app.handlers.cmd_unblock(_admin("7")))
+
+    assert "блокировк" in reply.lower()
+    assert _run(app.users.get(7)).blocked is False
+    assert 7 in _recipient_ids(app)
+
+
+def test_unblock_drops_stale_filter_cache(tmp_path):
+    app = _app(tmp_path)
+    _join(app, 7)
+    _run(app.handlers.cmd_revoke(_admin("7")))
+    app._user_filters[7] = (999, None)   # подложный протухший кеш
+
+    _run(app.handlers.cmd_unblock(_admin("7")))
+    assert 7 not in app._user_filters
+
+
+def test_unblock_is_a_noop_when_access_is_already_open(tmp_path):
+    app = _app(tmp_path)
+    _join(app, 7)
+    reply = _run(app.handlers.cmd_unblock(_admin("7")))
+    assert "и так открыт" in reply
+
+
+def test_unblock_warns_when_user_muted_themselves(tmp_path):
+    app = _app(tmp_path)
+    _join(app, 7)
+    _run(app.handlers.cmd_mute(_ctx(7)))
+    _run(app.handlers.cmd_revoke(_admin("7")))
+
+    reply = _run(app.handlers.cmd_unblock(_admin("7")))
+    # Доступ вернули, но человек всё равно ничего не получит — говорим об этом.
+    assert "паузу" in reply
+
+
+def test_unblock_warns_about_empty_rules(tmp_path):
+    app = _app(tmp_path)
+    _run(app.handlers.cmd_start(_ctx(7)))
+    _run(app.handlers.cmd_approve(_admin("7")))   # одобрен, но слов не добавлял
+    _run(app.handlers.cmd_revoke(_admin("7")))
+
+    reply = _run(app.handlers.cmd_unblock(_admin("7")))
+    assert "пустые правила" in reply
+
+
+def test_unblock_reports_unknown_id(tmp_path):
+    app = _app(tmp_path)
+    assert "не найден" in _run(app.handlers.cmd_unblock(_admin("4242")))
+
+
+# --------------------------------------------------------------------------- #
+# Само-восстановление: человек разблокировал бота
+# --------------------------------------------------------------------------- #
+
+def test_blocked_user_is_restored_when_they_write_again(tmp_path):
+    """Апдейт от человека доказывает, что бот до него достучится.
+
+    Без этого он навсегда остался бы вне рассылки: на /start получал бы
+    приветствие, а сообщений не видел.
+    """
+    app = _app(tmp_path)
+    _join(app, 7)
+    _run(app.users.set_blocked(7, True))
+    assert 7 not in _recipient_ids(app)
+
+    access = _run(app._authorize(7))
+
+    assert access.allowed is True
+    assert _run(app.users.get(7)).blocked is False
+    assert 7 in _recipient_ids(app)
+
+
+def test_self_healing_does_not_resurrect_revoked_access(tmp_path):
+    # Снятие blocked не должно возвращать доступ тому, кого отозвал админ.
+    app = _app(tmp_path)
+    _join(app, 7)
+    _run(app.users.set_blocked(7, True))
+    _run(app.handlers.cmd_revoke(_admin("7")))
+
+    access = _run(app._authorize(7))
+
+    assert access.allowed is False
+    assert 7 not in _recipient_ids(app)
+
+
+def test_self_healing_drops_filter_cache(tmp_path):
+    app = _app(tmp_path)
+    _join(app, 7)
+    _run(app.users.set_blocked(7, True))
+    app._user_filters[7] = (999, None)
+
+    _run(app._authorize(7))
+    assert 7 not in app._user_filters
+
+
+# --------------------------------------------------------------------------- #
+# Кнопки в /users симметричны состоянию
+# --------------------------------------------------------------------------- #
+
+def _actions_for(app, user_id):
+    from app.bot_handlers import _card_actions
+    caption, buttons = _card_actions(_run(app.users.get(user_id)))
+    return caption, [data for _, data in buttons]
+
+
+def test_user_card_offers_the_opposite_of_current_state(tmp_path):
+    app = _app(tmp_path)
+
+    _run(app.handlers.cmd_start(_ctx(7)))
+    assert _actions_for(app, 7) == (
+        "Заявка на доступ", ["approve:7", "deny:7"],
+    )
+
+    _run(app.handlers.cmd_approve(_admin("7")))
+    assert _actions_for(app, 7) == ("Доступ открыт", ["revoke:7"])
+
+    _run(app.handlers.cmd_revoke(_admin("7")))
+    assert _actions_for(app, 7) == ("Доступ закрыт", ["unblock:7"])
+
+    _run(app.handlers.cmd_unblock(_admin("7")))
+    _run(app.users.set_blocked(7, True))
+    assert _actions_for(app, 7) == ("Заблокировал бота", ["unblock:7"])
+
+
+def test_unblock_button_requires_admin(tmp_path):
+    app = _app(tmp_path)
+    _join(app, 7)
+    _run(app.handlers.cmd_revoke(_admin("7")))
+
+    sender = FakeSender()
+    listener = CommandListener(sender, authorize=app._authorize, owner_chat_id=OWNER)
+    app.handlers.register_all(listener)
+
+    _run(listener._dispatch({
+        "update_id": 1,
+        "callback_query": {
+            "id": "cb1",
+            "from": {"id": 7, "first_name": "U7"},
+            "message": {"message_id": 55, "chat": {"id": 7}},
+            "data": "unblock:7",
+        },
+    }))
+
+    # Сам себя вернуть нельзя.
+    assert _run(app.users.get(7)).status == STATUS_DENIED
+    assert sender.toasts == ["Недостаточно прав"]
+
+
+# --------------------------------------------------------------------------- #
+# Подсказки про конфликт с правилами из .env
+# --------------------------------------------------------------------------- #
+
+def _owner_app_with_legacy(tmp_path):
+    app = _app(tmp_path)
+    app.config.legacy_delivery = True     # целевой чат из .env = личка владельца
+    return app
+
+
+def test_keywords_explains_that_env_rules_are_in_charge(tmp_path):
+    app = _owner_app_with_legacy(tmp_path)
+    reply = _run(app.handlers.cmd_keywords(_admin(chat_id=OWNER)))
+    # Правил нет — значит работают .env, и это должно быть сказано вслух.
+    assert "правила оттуда" in reply
+
+
+def test_keywords_explains_that_personal_rules_win(tmp_path):
+    app = _owner_app_with_legacy(tmp_path)
+    _run(app.handlers.cmd_add(_admin("Науменко", chat_id=OWNER)))
+    reply = _run(app.handlers.cmd_keywords(_admin(chat_id=OWNER)))
+    assert "заменяют" in reply
+
+
+def test_mode_warns_when_there_are_no_rules_to_apply_it_to(tmp_path):
+    app = _app(tmp_path)
+    _run(app.handlers.cmd_start(_ctx(7)))
+    _run(app.handlers.cmd_approve(_admin("7")))   # одобрен, но слов не добавлял
+    reply = _run(app.handlers.cmd_mode(_ctx(7, args="all")))
+    assert "Режим" in reply and "ни на что не влияет" in reply
+
+
+def test_personal_commands_need_an_account(tmp_path):
+    """TARGET_CHAT_ID может быть группой: право команды даёт чат, а записи нет.
+
+    Без этой проверки запись личных правил падала бы на FOREIGN KEY, и человек
+    не получил бы вообще никакого ответа.
+    """
+    app = _app(tmp_path)
+    listener = CommandListener(
+        app.sender, authorize=app._authorize, owner_chat_id=OWNER
+    )
+    app.handlers.register_all(listener)
+    handler = listener._handlers["mode"].handler
+
+    reply = _run(handler(_ctx(4242, args="all")))
+    assert "Отправьте /start" in reply
+
+
+def test_mode_is_stored_and_reported(tmp_path):
+    app = _app(tmp_path)
+    _join(app, 7)
+    reply = _run(app.handlers.cmd_mode(_ctx(7, args="all")))
+
+    assert "all" in reply
+    assert _run(app.users.settings(7)).mode == "all"
+    assert "ни на что не влияет" not in reply
+
+
+def test_mode_rejects_garbage_without_changing_anything(tmp_path):
+    app = _app(tmp_path)
+    _join(app, 7)
+    _run(app.handlers.cmd_mode(_ctx(7, args="all")))
+    reply = _run(app.handlers.cmd_mode(_ctx(7, args="нечто")))
+
+    assert "⚠️" in reply
+    assert _run(app.users.settings(7)).mode == "all"
+
+
+def test_mode_change_is_visible_to_the_fanout_immediately(tmp_path):
+    app = _app(tmp_path)
+    _join(app, 7, keywords=("Науменко", "отсутствует"))
+    recipient = next(
+        r for r in _run(app.users.active_recipients()) if r.user.user_id == 7
+    )
+    assert app.filter_for(recipient).check("White: Науменко").matched is True
+
+    _run(app.handlers.cmd_mode(_ctx(7, args="all")))
+
+    recipient = next(
+        r for r in _run(app.users.active_recipients()) if r.user.user_id == 7
+    )
+    # Кеш фильтров ключуется по rev, поэтому пересборка происходит сама.
+    assert app.filter_for(recipient).check("White: Науменко").matched is False
+
+
+# --------------------------------------------------------------------------- #
+# Сбой команды должен быть виден пользователю
+# --------------------------------------------------------------------------- #
+
+def test_info_renders_without_exploding(tmp_path):
+    """Гоняем /info целиком.
+
+    Раньше describe_service падал на NameError, но ни один тест его не вызывал,
+    поэтому поломка жила только в journalctl, а пользователь видел молчание.
+    """
+    app = _app(tmp_path)
+    app.account = "Oleksandr (id=1)"
+    app.started_at = datetime(2026, 9, 29, 9, 0, tzinfo=timezone.utc)
+    app.config.target_chat_id = OWNER
+
+    reply = _run(app.handlers.cmd_info(_admin()))
+
+    assert "СОСТОЯНИЕ СЕРВИСА" in reply
+    assert "Работает" in reply
+    assert "Пользователей" in reply
+
+
+def test_uptime_is_human_readable():
+    from app.main import _format_uptime
+    assert _format_uptime(timedelta(seconds=30)) == "меньше минуты"
+    assert _format_uptime(timedelta(days=2, hours=3, minutes=4)) == "2 д 3 ч 4 мин"
+    assert _format_uptime(timedelta(hours=5)) == "5 ч"
+
+
+def test_crashing_handler_answers_instead_of_going_silent(tmp_path):
+    app = _app(tmp_path)
+    sender = FakeSender()
+    listener = CommandListener(sender, authorize=app._authorize, owner_chat_id=OWNER)
+
+    async def boom(ctx):
+        raise RuntimeError("что-то отвалилось")
+
+    listener.register("boom", boom)
+    _run(listener._dispatch({
+        "update_id": 1,
+        "message": {"chat": {"id": OWNER},
+                    "from": {"id": OWNER, "first_name": "Owner"},
+                    "text": "/boom"},
+    }))
+
+    assert len(sender.delivered) == 1
+    assert "внутренняя ошибка" in sender.delivered[0][1]
+
+
+def test_handler_returning_none_stays_silent(tmp_path):
+    # Отличаем «нечего отвечать» от «упало»: /users сам шлёт свои карточки.
+    app = _app(tmp_path)
+    sender = FakeSender()
+    listener = CommandListener(sender, authorize=app._authorize, owner_chat_id=OWNER)
+
+    async def quiet(ctx):
+        return None
+
+    listener.register("quiet", quiet)
+    _run(listener._dispatch({
+        "update_id": 1,
+        "message": {"chat": {"id": OWNER},
+                    "from": {"id": OWNER, "first_name": "Owner"},
+                    "text": "/quiet"},
+    }))
+
+    assert sender.delivered == []
+
+
+def test_bare_mode_offers_buttons_instead_of_silence(tmp_path):
+    """Из меню бота команда приходит без аргумента.
+
+    Набирать значение отдельным сообщением бесполезно — обычный текст
+    игнорируется, поэтому показываем кнопки.
+    """
+    app = _app(tmp_path)
+    _join(app, 7)
+    reply = _run(app.handlers.cmd_mode(_ctx(7)))
+
+    assert reply is None                       # ответ ушёл отдельным сообщением
+    chat, text = app.sender.delivered[-1]
+    assert chat == "7"
+    assert "Сейчас режим" in text
+    assert "/mode all" in text
+
+
+def test_mode_button_sets_the_pressers_own_mode(tmp_path):
+    app = _app(tmp_path)
+    _join(app, 7)
+
+    _run(app.handlers.cb_mode(
+        _ctx(7, args="all", callback_id="cb1", message_id=42)
+    ))
+
+    assert _run(app.users.settings(7)).mode == "all"
+    assert app.sender.toasts == ["Режим: all"]
+    # Сообщение с кнопками переписано результатом.
+    assert app.sender.edited and "all" in app.sender.edited[-1][2]
+
+
+def test_mode_button_does_not_require_admin(tmp_path):
+    """Кнопка режима — настройка самого нажавшего, а не решение о доступе."""
+    app = _app(tmp_path)
+    _join(app, 7)
+
+    sender = FakeSender()
+    app.sender = sender
+    app.handlers = BotHandlers(app)
+    listener = CommandListener(sender, authorize=app._authorize, owner_chat_id=OWNER)
+    app.handlers.register_all(listener)
+
+    _run(listener._dispatch({
+        "update_id": 1,
+        "callback_query": {
+            "id": "cb1",
+            "from": {"id": 7, "first_name": "U7"},
+            "message": {"message_id": 42, "chat": {"id": 7}},
+            "data": "mode:all",
+        },
+    }))
+
+    assert _run(app.users.settings(7)).mode == "all"
+    assert sender.toasts == ["Режим: all"]
+
+
+def test_access_buttons_still_require_admin(tmp_path):
+    # Послабление для кнопки режима не должно ослабить кнопки доступа.
+    app = _app(tmp_path)
+    _run(app.handlers.cmd_start(_ctx(7)))
+
+    sender = FakeSender()
+    listener = CommandListener(sender, authorize=app._authorize, owner_chat_id=OWNER)
+    app.handlers.register_all(listener)
+
+    _run(listener._dispatch({
+        "update_id": 1,
+        "callback_query": {
+            "id": "cb1",
+            "from": {"id": 7, "first_name": "U7"},
+            "message": {"message_id": 42, "chat": {"id": 7}},
+            "data": "approve:7",
+        },
+    }))
+
+    assert _run(app.users.get(7)).status == STATUS_PENDING
+    assert sender.toasts == ["Недостаточно прав"]
+
+
+def test_every_registered_command_answers_something(tmp_path):
+    """Страховка от повторения истории с /info.
+
+    Каждая команда должна что-то ответить или осознанно промолчать, но не
+    падать — иначе поломка снова окажется видна только в журнале.
+    """
+    app = _app(tmp_path)
+    app.account = "owner"
+    app.started_at = datetime(2026, 9, 29, 9, 0, tzinfo=timezone.utc)
+    _join(app, 7)
+
+    sender = FakeSender()
+    app.sender = sender
+    app.handlers = BotHandlers(app)
+    listener = CommandListener(sender, authorize=app._authorize, owner_chat_id=OWNER)
+    app.handlers.register_all(listener)
+
+    args = {"add": "слово", "remove": "слово", "exclude": "стоп",
+            "unexclude": "стоп", "regex": "off", "mode": "any",
+            "test": "текст", "approve": "7", "deny": "7", "revoke": "7",
+            "unblock": "7", "forget": "7"}
+
+    for name in listener.commands:
+        reply = _run(listener._handlers[name].handler(
+            _admin(args.get(name, ""), chat_id=OWNER)
+        ))
+        assert reply is None or "внутренняя ошибка" not in reply, name

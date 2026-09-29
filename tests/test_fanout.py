@@ -242,3 +242,70 @@ def test_editing_keywords_takes_effect_without_cache_flush(tmp_path):
     _run(app.users.add_keyword(1, "Науменко"))
     _handle(app, _message(message_id=6))
     assert app.sender.recipients == ["1"]
+
+
+# --------------------------------------------------------------------------- #
+# Один чат — один получатель
+# --------------------------------------------------------------------------- #
+# Отдельный случай владельца: TARGET_CHAT_ID — его же личка, поэтому чат
+# попадал в список дважды, и правила из .env глушили личные настройки.
+
+OWNER_CHAT = 999
+
+
+def _owner_app(tmp_path, **kwargs):
+    """Приложение, где целевой чат из .env совпадает с личкой пользователя."""
+    app = _app(tmp_path, legacy=True, **kwargs)
+    _run(app.users.ensure_admin(OWNER_CHAT, chat_id=OWNER_CHAT, label="owner"))
+    return app
+
+
+def test_owner_chat_is_never_targeted_twice(tmp_path):
+    app = _owner_app(tmp_path)
+    _run(app.users.add_keyword(OWNER_CHAT, "Науменко"))
+
+    targets = _run(app._collect_targets())
+    assert [t.key for t in targets] == [str(OWNER_CHAT)]
+
+
+def test_personal_rules_replace_env_rules_for_the_same_chat(tmp_path):
+    app = _owner_app(tmp_path)
+    # Личные правила строже, чем .env: нужны оба слова.
+    _run(app.users.add_keyword(OWNER_CHAT, "Науменко"))
+    _run(app.users.add_keyword(OWNER_CHAT, "отсутствует"))
+    _run(app.users.set_mode(OWNER_CHAT, "all"))
+
+    targets = _run(app._collect_targets())
+    assert len(targets) == 1
+    assert targets[0].user_id == OWNER_CHAT      # победили личные правила
+
+    _handle(app)
+    # Правила из .env совпали бы, но действуют личные — доставки нет.
+    assert app.sender.recipients == []
+
+
+def test_env_rules_apply_until_the_owner_sets_their_own(tmp_path):
+    app = _owner_app(tmp_path)
+    targets = _run(app._collect_targets())
+
+    assert len(targets) == 1
+    assert targets[0].user_id is None            # получатель из .env
+    _handle(app)
+    assert app.sender.recipients == [str(OWNER_CHAT)]
+
+
+def test_owner_personal_rules_can_widen_as_well_as_narrow(tmp_path):
+    app = _owner_app(tmp_path)
+    _run(app.users.add_keyword(OWNER_CHAT, "Natalie"))   # в .env такого слова нет
+
+    _handle(app, _message(text="Gray: Natalie"))
+    assert app.sender.recipients == [str(OWNER_CHAT)]
+
+
+def test_other_users_are_unaffected_by_the_owner_collision(tmp_path):
+    app = _owner_app(tmp_path)
+    _run(app.users.add_keyword(OWNER_CHAT, "Науменко"))
+    _add_user(app, 1, ["Науменко"])
+
+    _handle(app)
+    assert sorted(app.sender.recipients) == ["1", str(OWNER_CHAT)]

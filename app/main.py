@@ -331,6 +331,17 @@ class Application:
         user = await self.users.get(user_id)
         if user is None:
             return Access(allowed=False, is_admin=False)
+
+        if user.blocked:
+            # Апдейт от человека доказывает, что бот до него достучится, —
+            # значит он снял блокировку. Снимаем отметку сами, иначе он
+            # навсегда остался бы вне рассылки: приветствие на /start
+            # приходило бы, а сообщения — нет.
+            log.info("Пользователь %s снова доступен — возвращаю в рассылку",
+                     user_id)
+            await self.users.set_blocked(user_id, False)
+            self.drop_filter_cache(user_id)
+
         return Access(
             allowed=user.status == "approved", is_admin=bool(user.is_admin)
         )
@@ -567,24 +578,36 @@ class Application:
                  message.id, delivered, len(targets))
 
     async def _collect_targets(self) -> List["_Target"]:
-        """Получатель из .env плюс все одобренные пользователи со своими правилами."""
-        targets: List[_Target] = []
+        """Получатель из .env плюс все одобренные пользователи со своими правилами.
+
+        Ключ — chat_id, и он обязан быть уникальным: иначе один чат попал бы в
+        список дважды, первый получатель пометил бы сообщение доставленным, а
+        правила второго просто не сработали бы. Так и происходит у владельца,
+        у которого TARGET_CHAT_ID — его собственная личка.
+
+        Поэтому при совпадении чата личные правила ВЫТЕСНЯЮТ правила из .env:
+        команды бота — более позднее и более явное распоряжение, чем файл
+        конфигурации. Пока человек не завёл ни одного своего правила, он в
+        список пользователей не попадает, и .env продолжает работать как был.
+        """
+        targets: Dict[str, _Target] = {}
 
         if self.config.legacy_delivery:
-            targets.append(_Target(
-                key=str(self.config.target_chat_id),
+            key = str(self.config.target_chat_id)
+            targets[key] = _Target(
+                key=key,
                 label=f"чат из .env ({self.config.target_chat_id})",
                 message_filter=self.filter,
-            ))
+            )
 
         if not self.config.multi_user:
-            return targets
+            return list(targets.values())
 
         try:
             recipients = await self.users.active_recipients()
         except Exception as exc:  # noqa: BLE001 - сбой БД не должен ломать .env-доставку
             log.exception("Не удалось прочитать список получателей: %s", exc)
-            return targets
+            return list(targets.values())
 
         for recipient in recipients:
             if not recipient.settings.has_rules:
@@ -593,13 +616,29 @@ class Application:
                 log.debug("Пользователь %s без правил — пропускаю",
                           recipient.user.user_id)
                 continue
-            targets.append(_Target(
-                key=str(recipient.user.target_chat),
+
+            key = str(recipient.user.target_chat)
+            existing = targets.get(key)
+            if existing is not None and existing.user_id is not None:
+                # Два пользователя с одним чатом — такого быть не должно,
+                # но дублировать доставку всё равно нельзя.
+                log.warning("Чат %s уже занят пользователем %s — пропускаю %s",
+                            key, existing.user_id, recipient.user.user_id)
+                continue
+            if existing is not None:
+                log.info(
+                    "Чат %s: личные правила пользователя %s заменяют правила "
+                    "из .env", key, recipient.user.user_id,
+                )
+
+            targets[key] = _Target(
+                key=key,
                 label=recipient.user.label,
                 message_filter=self.filter_for(recipient),
                 user_id=recipient.user.user_id,
-            ))
-        return targets
+            )
+
+        return list(targets.values())
 
     async def _deliver_to(
         self,
@@ -661,6 +700,24 @@ class Application:
         log.info("Message %s -> %s доставлено (%s)",
                  message.id, target.label, result.reason)
         return True
+
+
+def _format_uptime(delta) -> str:
+    """'2 д 3 ч 4 мин' — без секунд, они в /info не нужны."""
+    total = int(delta.total_seconds())
+    if total < 60:
+        return "меньше минуты"
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    parts = []
+    if days:
+        parts.append(f"{days} д")
+    if hours:
+        parts.append(f"{hours} ч")
+    if minutes:
+        parts.append(f"{minutes} мин")
+    return " ".join(parts)
 
 
 # --------------------------------------------------------------------------- #

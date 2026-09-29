@@ -90,7 +90,7 @@ class CommandListener:
         self.owner_chat_id = None if owner_chat_id is None else str(owner_chat_id)
         self.poll_timeout = poll_timeout
         self._handlers: Dict[str, _Registration] = {}
-        self._callbacks: Dict[str, Handler] = {}
+        self._callbacks: Dict[str, _Registration] = {}
         self._offset: Optional[int] = None
 
     def register(
@@ -105,9 +105,18 @@ class CommandListener:
             handler=handler, public=public, admin_only=admin_only
         )
 
-    def register_callback(self, action: str, handler: Handler) -> None:
-        """Обработчик нажатия инлайн-кнопки с callback_data вида 'action:arg'."""
-        self._callbacks[action.lower()] = handler
+    def register_callback(
+        self, action: str, handler: Handler, *, admin_only: bool = True
+    ) -> None:
+        """Обработчик нажатия инлайн-кнопки с callback_data вида 'action:arg'.
+
+        По умолчанию кнопки админские: решения о доступе принимает только
+        владелец. Кнопки, которые пользователь нажимает в своих же настройках,
+        регистрируются с admin_only=False.
+        """
+        self._callbacks[action.lower()] = _Registration(
+            handler=handler, public=False, admin_only=admin_only
+        )
 
     @property
     def commands(self) -> tuple:
@@ -232,22 +241,23 @@ class CommandListener:
             return
 
         action, _, args = data.partition(":")
-        handler = self._callbacks.get(action.lower())
-        if handler is None:
+        registration = self._callbacks.get(action.lower())
+        if registration is None:
             log.info("Неизвестное действие кнопки %r", action)
             return
 
         access = await self._resolve_access(chat_id, author.get("id"))
-        # Кнопки — только для админов: сама по себе callback_data ничего не
-        # доказывает, карточку могли переслать.
-        if access is None or not access.is_admin:
-            log.warning("Нажатие %r от не-админа %s — игнорирую",
+        # Права проверяем по нажавшему, а не по callback_data: сами данные
+        # кнопки ничего не доказывают, карточку могли переслать.
+        if access is None or not self._permitted(registration, access):
+            log.warning("Нажатие %r от %s отклонено: нет прав",
                         action, author.get("id"))
             if callback_id:
                 await self.sender.answer_callback_query(
                     callback_id, "Недостаточно прав"
                 )
             return
+        handler = registration.handler
 
         ctx = self._context(
             chat_id,
@@ -318,7 +328,10 @@ class CommandListener:
             raise
         except Exception as exc:  # noqa: BLE001 - команда не должна валить сервис
             log.exception("Ошибка обработчика %s: %s", what, exc)
-            return None
+            # Молчать нельзя: человек не отличит поломку от «так задумано»,
+            # а в журнал он не смотрит. Сама команда при этом сервис не валит.
+            return ("⚠️ Команда не выполнена: внутренняя ошибка сервиса. "
+                    "Подробности — в журнале (journalctl -u telegram-filter).")
 
     @staticmethod
     def _parse_command(text: str) -> Tuple[str, str]:

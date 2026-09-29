@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
-from .bot_commands import CommandContext, CommandListener
+from .bot_commands import CommandContext, CommandListener, Handler
 from .bot_sender import escape_html, format_status
 from .users import (
     STATUS_APPROVED,
@@ -45,6 +45,12 @@ PUBLIC_MENU = [
 # Сколько карточек с кнопками отправляем за один /users.
 MAX_CARDS = 15
 
+_MODE_EXPLANATION = {
+    "any": "подходит любое из ключевых слов (или regex)",
+    "all": "должны встретиться все ключевые слова",
+    "regex": "решает только регулярное выражение",
+}
+
 USER_HELP = (
     "<b>Команды</b>\n\n"
     "/keywords — мои правила\n"
@@ -66,6 +72,7 @@ ADMIN_HELP = (
     "/users — все пользователи\n"
     "/approve &lt;id&gt;, /deny &lt;id&gt; — решение по заявке\n"
     "/revoke &lt;id&gt; — отозвать доступ\n"
+    "/unblock &lt;id&gt; — вернуть доступ (обратное к /revoke)\n"
     "/forget &lt;id&gt; — удалить пользователя целиком\n"
     "/denyall — отклонить все заявки\n"
     "/info — настройки и состояние сервиса"
@@ -124,18 +131,24 @@ class BotHandlers:
         listener.register("start", self.cmd_start, public=True)
         listener.register("help", self.cmd_help, public=True)
 
-        listener.register("status", self.cmd_status)
-        listener.register("keywords", self.cmd_keywords)
-        listener.register("add", self.cmd_add)
-        listener.register("remove", self.cmd_remove)
-        listener.register("exclude", self.cmd_exclude)
-        listener.register("unexclude", self.cmd_unexclude)
-        listener.register("clear", self.cmd_clear)
-        listener.register("regex", self.cmd_regex)
-        listener.register("mode", self.cmd_mode)
-        listener.register("test", self.cmd_test)
-        listener.register("mute", self.cmd_mute)
-        listener.register("unmute", self.cmd_unmute)
+        # Личные правила требуют записи в users: иначе писать их некуда.
+        # Такое бывает, когда TARGET_CHAT_ID — группа: право на команды даёт
+        # сам чат, а учётной записи у написавшего может и не быть.
+        for name, handler in (
+            ("status", self.cmd_status),
+            ("keywords", self.cmd_keywords),
+            ("add", self.cmd_add),
+            ("remove", self.cmd_remove),
+            ("exclude", self.cmd_exclude),
+            ("unexclude", self.cmd_unexclude),
+            ("clear", self.cmd_clear),
+            ("regex", self.cmd_regex),
+            ("mode", self.cmd_mode),
+            ("test", self.cmd_test),
+            ("mute", self.cmd_mute),
+            ("unmute", self.cmd_unmute),
+        ):
+            listener.register(name, self._personal(handler))
 
         listener.register("info", self.cmd_info, admin_only=True)
         listener.register("pending", self.cmd_pending, admin_only=True)
@@ -144,11 +157,26 @@ class BotHandlers:
         listener.register("deny", self.cmd_deny, admin_only=True)
         listener.register("denyall", self.cmd_deny_all, admin_only=True)
         listener.register("revoke", self.cmd_revoke, admin_only=True)
+        listener.register("unblock", self.cmd_unblock, admin_only=True)
         listener.register("forget", self.cmd_forget, admin_only=True)
 
         listener.register_callback("approve", self.cb_approve)
         listener.register_callback("deny", self.cb_deny)
         listener.register_callback("revoke", self.cb_revoke)
+        listener.register_callback("unblock", self.cb_unblock)
+        # Это настройка самого нажавшего, админом быть не нужно.
+        listener.register_callback("mode", self.cb_mode, admin_only=False)
+
+    def _personal(self, handler: Handler) -> Handler:
+        """Не пускает к личным правилам того, у кого нет учётной записи."""
+
+        async def wrapper(ctx: CommandContext) -> Optional[str]:
+            if await self.users.get(ctx.user_id) is None:
+                return ("Личные правила заводятся после регистрации. "
+                        "Отправьте /start.")
+            return await handler(ctx)
+
+        return wrapper
 
     # -- доступ ------------------------------------------------------------- #
 
@@ -217,7 +245,28 @@ class BotHandlers:
 
     async def cmd_keywords(self, ctx: CommandContext) -> str:
         settings = await self.users.settings(ctx.user_id)
-        return "<b>🔎 МОИ ПРАВИЛА</b>\n\n" + _describe_settings(settings)
+        text = "<b>🔎 МОИ ПРАВИЛА</b>\n\n" + _describe_settings(settings)
+        note = self._legacy_note(ctx, settings)
+        return text + note if note else text
+
+    def _legacy_note(self, ctx: CommandContext, settings: FilterSettings) -> str:
+        """Пояснение для чата, который одновременно является целью из .env.
+
+        Обычно это личка владельца: у него TARGET_CHAT_ID — он сам. Без этой
+        подсказки непонятно, почему /mode и /remove как будто не работают.
+        """
+        if not getattr(self.config, "legacy_delivery", False):
+            return ""
+        if str(ctx.chat_id) != str(self.config.target_chat_id):
+            return ""
+
+        if settings.has_rules:
+            return ("\n\nℹ️ Это и есть целевой чат из <code>.env</code>. "
+                    "Ваши правила выше <b>заменяют</b> <code>FILTER_*</code> "
+                    "для него — действуют именно они.")
+        return ("\n\nℹ️ Это целевой чат из <code>.env</code>, и сейчас работают "
+                "правила оттуда (<code>FILTER_*</code>). Как только вы добавите "
+                "своё слово через /add, они заменятся вашими.")
 
     async def cmd_add(self, ctx: CommandContext) -> str:
         return await self._add_word(ctx, field="keywords", label="Ключевое слово")
@@ -277,18 +326,72 @@ class BotHandlers:
             return "Regex отключён."
         return f"✅ Regex сохранён: <code>{escape_html(settings.regex)}</code>"
 
-    async def cmd_mode(self, ctx: CommandContext) -> str:
+    async def cmd_mode(self, ctx: CommandContext) -> Optional[str]:
+        if not ctx.args.strip():
+            # Из меню бота команда приходит без аргумента. Набирать значение
+            # отдельным сообщением бесполезно — обычный текст игнорируется,
+            # поэтому даём кнопки.
+            await self._send_mode_picker(ctx)
+            return None
         try:
             settings = await self.users.set_mode(ctx.user_id, ctx.args)
         except ValueError as exc:
             return f"⚠️ {escape_html(str(exc))}"
         self.app.drop_filter_cache(ctx.user_id)
-        explanation = {
-            "any": "подходит любое из ключевых слов (или regex)",
-            "all": "должны встретиться все ключевые слова",
-            "regex": "решает только регулярное выражение",
-        }[settings.mode]
-        return f"✅ Режим: <b>{settings.mode}</b> — {explanation}"
+        text = (f"✅ Режим: <b>{settings.mode}</b> — "
+                f"{_MODE_EXPLANATION[settings.mode]}")
+        if not settings.has_rules:
+            # Режим сам по себе ничего не делает, если правил нет.
+            text += ("\n⚠️ Правил пока нет, поэтому режим ни на что не влияет. "
+                     "Добавьте слово: /add Науменко")
+        return text + self._legacy_note(ctx, settings)
+
+    async def _send_mode_picker(self, ctx: CommandContext) -> None:
+        """Показывает текущий режим и кнопки выбора."""
+        current = await self.users.settings(ctx.user_id)
+        marks = {name: ("✅ " if name == current.mode else "") + name
+                 for name in _MODE_EXPLANATION}
+        await self.sender.send_message(
+            f"Сейчас режим: <b>{escape_html(current.mode)}</b>\n\n"
+            + "\n".join(
+                f"<b>{name}</b> — {text}"
+                for name, text in _MODE_EXPLANATION.items()
+            )
+            + "\n\nВыберите кнопкой или командой вида <code>/mode all</code>.",
+            chat_id=ctx.chat_id,
+            reply_markup=_keyboard([
+                (marks["any"], "mode:any"),
+                (marks["all"], "mode:all"),
+                (marks["regex"], "mode:regex"),
+            ]),
+        )
+
+    async def cb_mode(self, ctx: CommandContext) -> None:
+        """Нажатие кнопки выбора режима — это настройка САМОГО нажавшего."""
+        try:
+            settings = await self.users.set_mode(ctx.user_id, ctx.args)
+        except ValueError as exc:
+            if ctx.callback_id:
+                await self.sender.answer_callback_query(ctx.callback_id, str(exc))
+            return
+
+        self.app.drop_filter_cache(ctx.user_id)
+        if ctx.callback_id:
+            await self.sender.answer_callback_query(
+                ctx.callback_id, f"Режим: {settings.mode}"
+            )
+
+        text = (f"✅ Режим: <b>{settings.mode}</b> — "
+                f"{_MODE_EXPLANATION[settings.mode]}")
+        if not settings.has_rules:
+            text += ("\n⚠️ Правил пока нет, поэтому режим ни на что не влияет. "
+                     "Добавьте слово: /add Науменко")
+        text += self._legacy_note(ctx, settings)
+
+        if ctx.message_id is not None:
+            await self.sender.edit_message_text(ctx.chat_id, ctx.message_id, text)
+        else:
+            await self.sender.send_message(text, chat_id=ctx.chat_id)
 
     async def cmd_test(self, ctx: CommandContext) -> str:
         if not ctx.args:
@@ -309,6 +412,8 @@ class BotHandlers:
     # -- администрирование --------------------------------------------------- #
 
     async def cmd_info(self, ctx: CommandContext) -> str:
+        # ctx не нужен, но сигнатура у всех обработчиков одна — так их можно
+        # регистрировать единообразно.
         return await self.app.describe_service()
 
     async def cmd_pending(self, ctx: CommandContext) -> Optional[str]:
@@ -346,17 +451,18 @@ class BotHandlers:
             )
         await self.sender.send_message("\n".join(lines), chat_id=ctx.chat_id)
 
-        # Карточки с кнопкой отзыва — только для тех, у кого доступ есть.
-        revocable = [
-            user for user in everyone
-            if user.status == STATUS_APPROVED and not user.is_admin
-        ]
-        for user in revocable[:MAX_CARDS]:
+        # Карточка с кнопками на каждого, кроме самих админов: что именно
+        # предложить, зависит от того, как у человека закрыт доступ.
+        cards = [user for user in everyone if not user.is_admin]
+        for user in cards[:MAX_CARDS]:
+            caption, buttons = _card_actions(user)
             await self.sender.send_message(
-                f"<b>Доступ открыт</b>\n{escape_html(user.label)}",
+                f"<b>{caption}</b>\n{escape_html(user.label)}",
                 chat_id=ctx.chat_id,
-                reply_markup=_keyboard([("⛔ Отозвать", f"revoke:{user.user_id}")]),
+                reply_markup=_keyboard(buttons),
             )
+        if len(cards) > MAX_CARDS:
+            return f"…и ещё {len(cards) - MAX_CARDS}."
         return None
 
     async def cmd_approve(self, ctx: CommandContext) -> str:
@@ -367,6 +473,10 @@ class BotHandlers:
 
     async def cmd_revoke(self, ctx: CommandContext) -> str:
         return await self._decide_by_id(ctx, "revoke")
+
+    async def cmd_unblock(self, ctx: CommandContext) -> str:
+        """Обратное к /revoke: вернуть человека в рассылку."""
+        return await self._decide_by_id(ctx, "unblock")
 
     async def cmd_deny_all(self, ctx: CommandContext) -> str:
         denied = await self.users.deny_all_pending(by=ctx.user_id)
@@ -409,6 +519,9 @@ class BotHandlers:
     async def cb_revoke(self, ctx: CommandContext) -> None:
         await self._decide_by_button(ctx, "revoke")
 
+    async def cb_unblock(self, ctx: CommandContext) -> None:
+        await self._decide_by_button(ctx, "unblock")
+
     async def _decide_by_button(self, ctx: CommandContext, action: str) -> None:
         user_id = _parse_user_id(ctx.args)
         if user_id is None:
@@ -437,6 +550,9 @@ class BotHandlers:
         existing = await self.users.get(user_id)
         if existing is None:
             return f"Пользователь {user_id} не найден.", "Не найден"
+
+        if action == "unblock":
+            return await self._unblock(existing, by=by)
 
         if action == "approve":
             user = await self.users.approve(user_id, by=by)
@@ -473,6 +589,46 @@ class BotHandlers:
             )
         return (f"⛔ Доступ {verb}: {escape_html(user.label)}",
                 "Отклонено" if action == "deny" else "Отозвано")
+
+    async def _unblock(self, user: User, *, by: int) -> Tuple[str, str]:
+        """Возвращает человека в рассылку — обратное к /revoke.
+
+        Закрыть доступ могли двумя разными способами, и лечатся они по-разному:
+        админ мог отозвать доступ (status=denied), а мог сам пользователь
+        заблокировать бота (blocked=1) — тогда сервис снял его с рассылки, чтобы
+        не долбиться в закрытую дверь. Команда разбирает оба случая.
+        """
+        done = []
+        if user.status != STATUS_APPROVED:
+            # approve заодно снимает blocked.
+            user = await self.users.approve(user.user_id, by=by)
+            done.append("доступ возвращён")
+        elif user.blocked:
+            await self.users.set_blocked(user.user_id, False)
+            user = await self.users.get(user.user_id)
+            done.append("отметка о блокировке снята")
+
+        if not done:
+            return (f"У {escape_html(user.label)} доступ и так открыт.",
+                    "Уже открыт")
+
+        self.app.drop_filter_cache(user.user_id)
+        log.info("Админ %s вернул доступ: %s (%s)", by, user.label, done[0])
+
+        text = f"✅ {done[0].capitalize()}: {escape_html(user.label)}"
+        # Честно предупреждаем, почему человек всё ещё может ничего не получать.
+        if user.muted:
+            text += "\n⚠️ Но он сам поставил рассылку на паузу (/mute)."
+        else:
+            settings = await self.users.settings(user.user_id)
+            if not settings.has_rules:
+                text += "\n⚠️ Но у него пустые правила — пока он не добавит " \
+                        "слово через /add, сообщений не будет."
+
+        await self._notify_user(
+            user, "✅ Доступ к рассылке восстановлен администратором."
+        )
+        return text, "Возвращён"
 
     # -- уведомления --------------------------------------------------------- #
 
@@ -518,6 +674,24 @@ class BotHandlers:
             await self.sender.deliver(user.target_chat, text)
         except Exception as exc:  # noqa: BLE001 - молчание пользователя не наша беда
             log.warning("Не удалось уведомить %s: %s", user.label, exc)
+
+
+def _card_actions(user: User) -> Tuple[str, List[Tuple[str, str]]]:
+    """Подпись и кнопки карточки в /users — по текущему состоянию человека."""
+    if user.status == STATUS_PENDING:
+        return "Заявка на доступ", [
+            ("✅ Одобрить", f"approve:{user.user_id}"),
+            ("⛔ Отклонить", f"deny:{user.user_id}"),
+        ]
+    if user.status == STATUS_DENIED:
+        return "Доступ закрыт", [("✅ Вернуть", f"unblock:{user.user_id}")]
+    if user.blocked:
+        # Человек заблокировал бота; отметка снимется и сама, как только он
+        # что-нибудь напишет, но админу нужна возможность не ждать.
+        return "Заблокировал бота", [
+            ("🔔 Вернуть в рассылку", f"unblock:{user.user_id}")
+        ]
+    return "Доступ открыт", [("⛔ Отозвать", f"revoke:{user.user_id}")]
 
 
 _STATUS_ICONS = {
