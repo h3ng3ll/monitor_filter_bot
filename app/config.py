@@ -83,6 +83,20 @@ def _get_list(name: str) -> Tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
+def _get_int_list(name: str) -> Tuple[int, ...]:
+    """Читает список Telegram id через запятую (ADMIN_IDS=111,222)."""
+    values = []
+    for item in _get_list(name):
+        try:
+            values.append(int(item))
+        except ValueError:
+            raise ConfigError(
+                f"{name} должен содержать числовые Telegram id, "
+                f"получено: {item!r}"
+            ) from None
+    return tuple(values)
+
+
 def _parse_source(raw: str) -> Union[str, int]:
     """Источник может быть @username, username или числовой id."""
     if raw.lstrip("-").isdigit():
@@ -129,6 +143,14 @@ class Config:
 
     # --- Команды бота ---
     bot_commands: bool           # False = не опрашивать getUpdates, /info не работает
+
+    # --- Многопользовательский режим ---
+    # Админ по умолчанию — владелец Telethon-сессии (определяется при старте).
+    # Здесь перечисляются только ДОПОЛНИТЕЛЬНЫЕ админы.
+    admin_ids: Tuple[int, ...]
+    multi_user: bool             # False = только TARGET_CHAT_ID, как раньше
+    legacy_delivery: bool        # True = .env-фильтр по-прежнему шлёт в TARGET_CHAT_ID
+    max_keywords_per_user: int   # предохранитель от бесконечного списка
 
     # --- Хранилище обработанных сообщений ---
     db_path: Path
@@ -236,6 +258,12 @@ def load_config(env_file: Optional[Path] = None) -> Config:
         startup_probe=startup_probe,
         startup_probe_limit=startup_probe_limit,
         bot_commands=bot_commands,
+        admin_ids=_get_int_list("ADMIN_IDS"),
+        multi_user=_get_bool("MULTI_USER", True),
+        legacy_delivery=_get_bool("LEGACY_DELIVERY", True),
+        max_keywords_per_user=_get_int(
+            "MAX_KEYWORDS_PER_USER", 50, minimum=1
+        ),
         db_path=db_path,
         db_retention_days=_get_int("DB_RETENTION_DAYS", 30, minimum=0),
         log_level=log_level,

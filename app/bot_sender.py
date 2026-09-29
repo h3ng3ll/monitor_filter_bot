@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
 import random
 from datetime import datetime
@@ -20,31 +19,75 @@ from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import aiohttp
 
+# escape_html и обрезка живут в formatting.py вместе с разбором entities.
+# Здесь они пере-экспортируются, чтобы не ломать существующие импорты.
+from .formatting import TRUNCATION_SUFFIX, escape_html, render_body
+
 log = logging.getLogger(__name__)
 
 API_BASE = "https://api.telegram.org"
 
 # Жёсткий лимит Telegram на текст одного сообщения.
 TELEGRAM_MAX_TEXT = 4096
-# Запас под служебные строки (заголовок, источник, время, ID, ссылка).
-TRUNCATION_SUFFIX = "\n…[сообщение обрезано]"
+
+__all__ = [
+    "API_BASE",
+    "TELEGRAM_MAX_TEXT",
+    "TRUNCATION_SUFFIX",
+    "BotApiError",
+    "BotBlockedError",
+    "BotSender",
+    "escape_html",
+    "format_message",
+    "format_message_with_fallback",
+    "format_status",
+]
 
 
 class BotApiError(RuntimeError):
     """Ошибка Bot API, которую нет смысла повторять (неверный токен, chat_id…)."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: Optional[int] = None,
+        description: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.description = description or message
 
-# --------------------------------------------------------------------------- #
-# Форматирование
-# --------------------------------------------------------------------------- #
 
-def escape_html(text: str) -> str:
-    """Экранирует текст для Telegram HTML parse mode.
+class BotBlockedError(BotApiError):
+    """Получатель недоступен навсегда: заблокировал бота, удалён, не нажимал Start."""
 
-    Telegram требует экранировать ``&``, ``<`` и ``>``; кавычки трогать не нужно,
-    поэтому ``quote=False`` — так текст остаётся читаемым.
-    """
-    return html.escape(text or "", quote=False)
+
+# Тексты Telegram, после которых слать в этот чат бессмысленно.
+_BLOCKED_MARKERS = (
+    "bot was blocked by the user",
+    "user is deactivated",
+    "chat not found",
+    "bot can't initiate conversation with a user",
+    "peer_id_invalid",
+    "have no rights to send a message",
+)
+
+# Признаки того, что Bot API споткнулся именно о разметку, а не о чат или токен.
+_MARKUP_ERROR_MARKERS = (
+    "can't parse",
+    "unsupported start tag",
+    "unmatched end tag",
+    "unclosed",
+    "entity",
+    "entities",
+    "tg-emoji",
+)
+
+
+def _matches(description: str, markers: Sequence[str]) -> bool:
+    lowered = (description or "").lower()
+    return any(marker in lowered for marker in markers)
 
 
 def format_message(
@@ -53,6 +96,7 @@ def format_message(
     sent_at: Optional[datetime],
     message_id: int,
     text: str,
+    entities: Optional[Sequence[Any]] = None,
     reason: Optional[str] = None,
     link: Optional[str] = None,
     header: str = "🚨 ВАЖНОЕ СООБЩЕНИЕ",
@@ -60,8 +104,12 @@ def format_message(
 ) -> str:
     """Собирает готовое HTML-уведомление.
 
-    Весь пользовательский текст экранируется, поэтому символы вроде ``<``
-    или ``&`` из исходного сообщения не ломают разметку.
+    ``entities`` — разметка исходного сообщения (Telethon). Если она передана,
+    копия воспроизводит оформление оригинала: ссылки остаются ссылками. Всё,
+    что не попало в известные сущности, экранируется, поэтому символы вроде
+    ``<`` или ``&`` из исходного сообщения разметку не ломают.
+    Без ``entities`` результат такой же, как был до появления этой поддержки.
+
     Ссылка добавляется, только если она реально существует (``link is not None``) —
     выдуманные ссылки не строятся.
     """
@@ -86,10 +134,25 @@ def format_message(
     tail = "\n".join(tail_lines)
 
     body_budget = max_length - len(head) - len(tail) - 2  # 2 переноса строки
-    body_raw = text.strip() if text else "(без текста)"
-    body = _truncate(body_raw, body_budget)
+    if text:
+        body = render_body(text, entities, budget=body_budget)
+    else:
+        body = escape_html("(без текста)")
 
-    return f"{head}\n{escape_html(body)}\n{tail}"
+    return f"{head}\n{body}\n{tail}"
+
+
+def format_message_with_fallback(**kwargs: Any) -> Tuple[str, str]:
+    """Пара «с разметкой оригинала, без неё».
+
+    Второй вариант нужен на случай, когда Bot API не примет разметку: в нём
+    остаётся только наша собственная, заведомо корректная. Лучше уведомление
+    без оформления, чем потерянное уведомление.
+    """
+    rich = format_message(**kwargs)
+    if not kwargs.get("entities"):
+        return rich, rich
+    return rich, format_message(**{**kwargs, "entities": None})
 
 
 def format_status(
@@ -111,23 +174,6 @@ def format_status(
         lines.append("")
         lines.append(escape_html(note))
     return "\n".join(lines)[:max_length]
-
-
-def _truncate(text: str, budget: int) -> str:
-    """Обрезает текст так, чтобы экранированная версия влезла в бюджет."""
-    if budget <= 0:
-        return "…"
-    # Экранирование может удлинить строку (& -> &amp;), поэтому проверяем
-    # результат и уменьшаем срез, пока не влезем.
-    if len(escape_html(text)) <= budget:
-        return text
-    limit = budget - len(TRUNCATION_SUFFIX)
-    while limit > 0:
-        candidate = text[:limit] + TRUNCATION_SUFFIX
-        if len(escape_html(candidate)) <= budget:
-            return candidate
-        limit -= max(1, (len(escape_html(candidate)) - budget))
-    return "…"
 
 
 def _format_datetime(value: Optional[datetime]) -> str:
@@ -188,27 +234,118 @@ class BotSender:
 
     # -- отправка --------------------------------------------------------- #
 
-    async def send_message(self, html_text: str, *, disable_preview: bool = True) -> bool:
-        """Отправляет готовый HTML в целевой чат.
+    async def deliver(
+        self,
+        chat_id: Union[str, int],
+        html_text: str,
+        *,
+        disable_preview: bool = True,
+        reply_markup: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Отправляет готовый HTML в указанный чат.
 
-        Возвращает True при успехе. При постоянной ошибке (неверный chat_id,
-        забаненный бот и т.п.) возвращает False — вызывающий код не должен
-        помечать сообщение как обработанное.
+        Бросает BotBlockedError, если получатель недоступен навсегда, и
+        BotApiError на прочих отказах — вызывающий код решает, что делать.
         """
-        payload = {
-            "chat_id": self.chat_id,
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
             "text": html_text,
             "parse_mode": "HTML",
+            # Тело содержит ссылки из оригинала: без этого флага Telegram
+            # прицепил бы к каждому уведомлению карточку предпросмотра.
             "disable_web_page_preview": disable_preview,
         }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        await self._call("sendMessage", payload)
+
+    async def send_message(
+        self,
+        html_text: str,
+        *,
+        chat_id: Optional[Union[str, int]] = None,
+        disable_preview: bool = True,
+        reply_markup: Optional[Dict[str, Any]] = None,
+        fallback_text: Optional[str] = None,
+    ) -> bool:
+        """Отправляет готовый HTML. Возвращает True при успехе.
+
+        ``chat_id=None`` — чат по умолчанию из .env (TARGET_CHAT_ID).
+
+        ``fallback_text`` — тот же текст без разметки оригинала. Если Bot API
+        не разберёт HTML (чужой эмодзи, пересекающиеся сущности, новый тип
+        сущности), уведомление уйдёт в запасном виде: потерять алерт из-за
+        оформления нельзя. Повтор ровно один.
+        """
+        target = self.chat_id if chat_id is None else chat_id
         try:
-            await self._call("sendMessage", payload)
+            await self.deliver(
+                target,
+                html_text,
+                disable_preview=disable_preview,
+                reply_markup=reply_markup,
+            )
             return True
         except BotApiError as exc:
-            log.error("Bot API отказал в отправке: %s", exc)
+            if (
+                fallback_text is not None
+                and fallback_text != html_text
+                and _matches(str(exc), _MARKUP_ERROR_MARKERS)
+            ):
+                log.warning(
+                    "Bot API не принял разметку (%s) — повторяю без неё", exc
+                )
+                return await self.send_message(
+                    fallback_text,
+                    chat_id=chat_id,
+                    disable_preview=disable_preview,
+                    reply_markup=reply_markup,
+                )
+            log.error("Bot API отказал в отправке в %s: %s", target, exc)
             return False
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             log.error("Bot API недоступен после всех попыток: %s", exc)
+            return False
+
+    async def answer_callback_query(
+        self, callback_id: str, text: Optional[str] = None
+    ) -> None:
+        """Гасит «часики» на нажатой инлайн-кнопке и показывает всплывашку.
+
+        Не критично: если не получилось, кнопка просто повисит — не повод
+        ронять обработку нажатия.
+        """
+        payload: Dict[str, Any] = {"callback_query_id": callback_id}
+        if text:
+            payload["text"] = text
+        try:
+            await self._call("answerCallbackQuery", payload)
+        except (BotApiError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            log.warning("answerCallbackQuery не прошёл: %s", exc)
+
+    async def edit_message_text(
+        self,
+        chat_id: Union[str, int],
+        message_id: int,
+        html_text: str,
+        *,
+        reply_markup: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Переписывает уже отправленное сообщение (карточку заявки)."""
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": html_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        # Пустая клавиатура убирает кнопки, чтобы карточку не нажали дважды.
+        payload["reply_markup"] = reply_markup or {"inline_keyboard": []}
+        try:
+            await self._call("editMessageText", payload)
+            return True
+        except (BotApiError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            log.warning("Не удалось обновить карточку: %s", exc)
             return False
 
     # -- приём апдейтов ---------------------------------------------------- #
@@ -223,7 +360,8 @@ class BotSender:
         """
         payload: Dict[str, Any] = {
             "timeout": timeout,
-            "allowed_updates": ["message"],
+            # callback_query — нажатия инлайн-кнопок на карточках заявок.
+            "allowed_updates": ["message", "callback_query"],
         }
         if offset is not None:
             payload["offset"] = offset
@@ -231,20 +369,29 @@ class BotSender:
             "getUpdates", payload, http_timeout=timeout + self.timeout.total
         )
 
-    async def set_my_commands(self, commands: Sequence[Tuple[str, str]]) -> None:
-        """Регистрирует меню команд, чтобы /info был виден в интерфейсе.
+    async def set_my_commands(
+        self,
+        commands: Sequence[Tuple[str, str]],
+        *,
+        scope: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Регистрирует меню команд, чтобы они были видны в интерфейсе.
 
+        ``scope`` позволяет показать расширенный список только админам.
         Не критично: при ошибке только пишем в лог — бот остаётся рабочим.
         """
+        payload: Dict[str, Any] = {
+            "commands": [
+                {"command": name, "description": text}
+                for name, text in commands
+            ]
+        }
+        if scope is not None:
+            payload["scope"] = scope
         try:
-            await self._call(
-                "setMyCommands",
-                {"commands": [
-                    {"command": name, "description": text}
-                    for name, text in commands
-                ]},
-            )
-            log.info("Меню команд обновлено: %s",
+            await self._call("setMyCommands", payload)
+            log.info("Меню команд обновлено%s: %s",
+                     "" if scope is None else " (адресно)",
                      ", ".join("/" + name for name, _ in commands))
         except (BotApiError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
             log.warning("Не удалось обновить меню команд: %s", exc)
@@ -310,7 +457,11 @@ class BotSender:
                         continue
 
                     if response.status >= 500:
-                        last_error = BotApiError(f"{method}: {description}")
+                        last_error = BotApiError(
+                            f"{method}: {description}",
+                            status=response.status,
+                            description=description,
+                        )
                         log.warning(
                             "Bot API 5xx на %s: %s (попытка %s/%s)",
                             method, description, attempt, self.max_retries + 1,
@@ -319,7 +470,20 @@ class BotSender:
                         continue
 
                     # 400/401/403 — повторять бессмысленно.
-                    raise BotApiError(f"{method}: {description}")
+                    if response.status in (400, 403) and _matches(
+                        description, _BLOCKED_MARKERS
+                    ):
+                        # Отдельный тип: получателя нет смысла беспокоить снова.
+                        raise BotBlockedError(
+                            f"{method}: {description}",
+                            status=response.status,
+                            description=description,
+                        )
+                    raise BotApiError(
+                        f"{method}: {description}",
+                        status=response.status,
+                        description=description,
+                    )
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 last_error = exc

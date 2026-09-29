@@ -4,7 +4,7 @@
 
     Telethon NewMessage (от источника)
         -> проверка отправителя
-        -> текст сообщения
+        -> текст сообщения + разметка (entities)
         -> MessageFilter
         -> проверка дубликата (SQLite)
         -> format_message()
@@ -24,17 +24,28 @@ import asyncio
 import logging
 import signal
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 from telethon import events, utils
 from telethon import errors as tg_errors
 
-from .bot_commands import CommandListener
-from .bot_sender import BotApiError, BotSender, format_message, format_status
+from .bot_commands import Access, CommandListener
+from .bot_handlers import PUBLIC_MENU, BotHandlers
+from .bot_sender import (
+    BotApiError,
+    BotBlockedError,
+    BotSender,
+    format_message,
+    format_message_with_fallback,
+    format_status,
+)
+from .formatting import message_entities
 from .config import Config, ConfigError, load_config
 from .filter import MessageFilter
 from .models import ProcessedMessageStore
+from .users import Recipient, UserStore
 from .telegram_client import (
     BotSessionError,
     NotAuthorizedError,
@@ -56,6 +67,28 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 # кодом (RestartPreventExitStatus=78), поэтому бюджет StartLimitBurst не
 # сгорает и после починки обычный `systemctl start` срабатывает сразу.
 EXIT_PERMANENT = 78  # EX_CONFIG из sysexits.h
+
+# Отправки идут последовательно, и круг до api.telegram.org с Pi занимает
+# 80–200 мс, то есть потолок ~5–12 сообщений/с — вдвое-втрое ниже общего
+# лимита Bot API. Пауза включается только на больших рассылках.
+FANOUT_PAUSE = 0.05
+FANOUT_PAUSE_AFTER = 20
+
+
+@dataclass(frozen=True)
+class _Target:
+    """Один получатель рассылки."""
+
+    key: str                       # chat_id для Bot API и ключ в журнале доставок
+    label: str                     # как назвать в логе
+    message_filter: MessageFilter
+    user_id: Optional[int] = None  # None — получатель из .env, а не пользователь
+
+
+def _is_markup_failure(exc: BotApiError) -> bool:
+    """Telegram споткнулся о разметку, а не о чат или токен."""
+    lowered = str(exc).lower()
+    return "parse" in lowered or "entit" in lowered or "tag" in lowered
 
 
 def setup_logging(level: str) -> None:
@@ -84,7 +117,16 @@ class Application:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.filter = MessageFilter.from_config(config)
-        self.store = ProcessedMessageStore(config.db_path, config.db_retention_days)
+        self.store = ProcessedMessageStore(
+            config.db_path,
+            config.db_retention_days,
+            legacy_recipient=(
+                str(config.target_chat_id) if config.legacy_delivery else None
+            ),
+        )
+        self.users = UserStore(
+            config.db_path, max_keywords=config.max_keywords_per_user
+        )
         self.sender = BotSender(
             config.target_bot_token,
             config.target_chat_id,
@@ -94,16 +136,24 @@ class Application:
         )
         self.client = create_client(config)
         self.commands = CommandListener(
-            self.sender, allowed_chat_id=config.target_chat_id
+            self.sender,
+            authorize=self._authorize,
+            owner_chat_id=config.target_chat_id,
         )
-        self.commands.register("info", self._cmd_info)
-        self.commands.register("start", self._cmd_start)
+        self.handlers = BotHandlers(self)
+        self.handlers.register_all(self.commands)
         self.stop_event = asyncio.Event()
         self.source_entity = None
         self.source_id: Optional[int] = None
         self.source_label: str = config.source_label
         self.started_at = datetime.now(timezone.utc)
         self.account: str = "неизвестен"
+        # Владелец Telethon-сессии — он же администратор: сообщения приходят
+        # именно его аккаунту, ему и решать, кому их пересылать.
+        self.owner_id: Optional[int] = None
+        # Скомпилированные фильтры пользователей: user_id -> (rev, фильтр).
+        # Ключ по rev, поэтому правка правил сама обесценивает запись.
+        self._user_filters: Dict[int, Tuple[int, MessageFilter]] = {}
 
     # -- запуск / остановка ------------------------------------------------ #
 
@@ -111,6 +161,7 @@ class Application:
         self._install_signal_handlers()
         try:
             await self.store.connect()
+            await self.users.connect()
             removed = await self.store.prune()
             if removed:
                 log.info("Очищено старых записей из журнала: %s", removed)
@@ -118,6 +169,7 @@ class Application:
             await self.sender.start()
             await ensure_authorized(self.client, allow_interactive=False)
             self.account = await self._describe_account()
+            await self._setup_admins()
 
             self.source_entity = await resolve_source(self.client, self.config.source)
             self.source_id = utils.get_peer_id(self.source_entity)
@@ -134,9 +186,7 @@ class Application:
 
             listener: Optional[asyncio.Future] = None
             if self.config.bot_commands:
-                await self.sender.set_my_commands(
-                    [("info", "Настройки и состояние сервиса")]
-                )
+                await self.sender.set_my_commands(PUBLIC_MENU)
                 listener = asyncio.ensure_future(self.commands.run(self.stop_event))
             else:
                 log.info("Команды бота отключены (BOT_COMMANDS=false)")
@@ -176,6 +226,11 @@ class Application:
         except Exception as exc:  # noqa: BLE001
             log.warning("Ошибка при закрытии SQLite: %s", exc)
 
+        try:
+            await self.users.close()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Ошибка при закрытии SQLite (пользователи): %s", exc)
+
         log.info("Сервис остановлен")
 
     def _install_signal_handlers(self) -> None:
@@ -203,15 +258,111 @@ class Application:
     # -- команды бота ------------------------------------------------------- #
 
     async def _describe_account(self) -> str:
-        """Имя и id аккаунта Telethon — главный признак верной настройки."""
+        """Имя и id аккаунта Telethon — главный признак верной настройки.
+
+        Попутно запоминаем id владельца: это и есть администратор сервиса.
+        """
         try:
             me = await self.client.get_me()
         except Exception as exc:  # noqa: BLE001 - не повод падать
             log.warning("Не удалось получить аккаунт: %s", exc)
             return "неизвестен"
-        return f"{utils.get_display_name(me) or 'unknown'} (id={getattr(me, 'id', '?')})"
+        owner_id = getattr(me, "id", None)
+        if isinstance(owner_id, int):
+            self.owner_id = owner_id
+        return f"{utils.get_display_name(me) or 'unknown'} (id={owner_id or '?'})"
 
-    async def _cmd_info(self) -> str:
+    async def _setup_admins(self) -> None:
+        """Владелец сессии — админ по умолчанию, плюс ADMIN_IDS из .env."""
+        if not self.config.multi_user:
+            log.info("Многопользовательский режим выключен (MULTI_USER=false)")
+            return
+
+        admin_ids: List[int] = []
+        if self.owner_id is not None:
+            admin_ids.append(self.owner_id)
+        else:
+            # get_me не ответил: не оставлять же сервис без админа совсем.
+            log.warning(
+                "Не удалось определить владельца сессии — админом станет только "
+                "то, что указано в ADMIN_IDS"
+            )
+        admin_ids.extend(
+            admin_id for admin_id in self.config.admin_ids
+            if admin_id not in admin_ids
+        )
+
+        if not admin_ids:
+            log.error(
+                "Админов нет: заявки на доступ будет некому одобрять. "
+                "Укажите ADMIN_IDS в .env."
+            )
+            return
+
+        owner_chat = (
+            self.config.target_chat_id
+            if isinstance(self.config.target_chat_id, int)
+            else None
+        )
+        for admin_id in admin_ids:
+            chat_id = owner_chat if admin_id == self.owner_id else admin_id
+            await self.users.ensure_admin(
+                admin_id, chat_id=chat_id, label=self.account
+            )
+        log.info("Администраторы: %s", ", ".join(str(i) for i in admin_ids))
+
+        counts = await self.users.counts()
+        log.info(
+            "Пользователи: одобрено %s, заявок %s",
+            counts.get("approved", 0), counts.get("pending", 0),
+        )
+
+    async def admin_chat_ids(self) -> List[int]:
+        """Куда слать уведомления админам."""
+        chats: List[int] = []
+        for admin in await self.users.list_admins():
+            chat = admin.target_chat
+            if chat and chat not in chats:
+                chats.append(chat)
+        return chats
+
+    async def _authorize(self, user_id: int) -> Access:
+        """Права для CommandListener — из БД, поэтому отзыв срабатывает сразу."""
+        user = await self.users.get(user_id)
+        if user is None:
+            return Access(allowed=False, is_admin=False)
+        return Access(
+            allowed=user.status == "approved", is_admin=bool(user.is_admin)
+        )
+
+    # -- персональные фильтры ----------------------------------------------- #
+
+    def build_filter(self, settings) -> MessageFilter:
+        """Собирает MessageFilter из сохранённых настроек пользователя."""
+        return MessageFilter.from_settings(
+            keywords=settings.keywords,
+            exclude_keywords=settings.exclude_keywords,
+            regex=settings.regex,
+            mode=settings.mode,
+            case_sensitive=settings.case_sensitive,
+            min_length=settings.min_length,
+            max_length=settings.max_length,
+        )
+
+    def filter_for(self, recipient: Recipient) -> MessageFilter:
+        """Фильтр получателя. Кеш обесценивается ростом rev при правке правил."""
+        cached = self._user_filters.get(recipient.user.user_id)
+        if cached is not None and cached[0] == recipient.settings.rev:
+            return cached[1]
+        built = self.build_filter(recipient.settings)
+        self._user_filters[recipient.user.user_id] = (recipient.settings.rev, built)
+        return built
+
+    def drop_filter_cache(self, user_id: int) -> None:
+        """Выбрасывает скомпилированный фильтр — после правки правил или отзыва."""
+        self._user_filters.pop(user_id, None)
+
+    async def describe_service(self) -> str:
         """Ответ на /info: настройки и состояние сервиса."""
         probe = (
             f"включена ({self.config.startup_probe_limit} сообщений)"
@@ -223,25 +374,26 @@ class Application:
             log.warning("Не удалось прочитать счётчик журнала: %s", exc)
             processed = "неизвестно"
 
+        try:
+            counts = await self.users.counts()
+            people = (f"{counts.get('approved', 0)} одобрено, "
+                      f"{counts.get('pending', 0)} заявок")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Не удалось прочитать счётчик пользователей: %s", exc)
+            people = "неизвестно"
+
         return format_status(
             header="ℹ️ СОСТОЯНИЕ СЕРВИСА",
             fields=[
                 ("Аккаунт", self.account),
                 ("Источник", self.source_label),
-                ("Правила", self.filter.describe()),
+                ("Правила (.env)", self.filter.describe()),
                 ("Целевой чат", str(self.config.target_chat_id)),
+                ("Пользователей", people),
                 ("Самопроверка при старте", probe),
-                ("Переслано сообщений", processed),
+                ("Доставлено сообщений", processed),
                 ("Работает", _format_uptime(datetime.now(timezone.utc) - self.started_at)),
             ],
-        )
-
-    async def _cmd_start(self) -> str:
-        return format_status(
-            header="👋 Фильтр App Store Monitor",
-            fields=[("Источник", self.source_label)],
-            note="Сюда приходят только сообщения, подходящие под правила. "
-                 "/info — показать настройки и состояние.",
         )
 
     # -- самопроверка при старте -------------------------------------------- #
@@ -303,20 +455,25 @@ class Application:
                 link = build_message_link(chat, message.id)
             except Exception:  # noqa: BLE001 - ссылка необязательна
                 link = None
-            payload = format_message(
+            payload, fallback = format_message_with_fallback(
                 header="✅ СЕРВИС ЗАПУЩЕН — последнее совпадение",
                 source_label=self.source_label,
                 sent_at=message.date,
                 message_id=message.id,
                 text=message.raw_text or "",
+                entities=message_entities(message),
                 reason=result.reason,
                 link=link,
             )
+            await self._send_probe_payload(payload, fallback)
+            return
 
         await self._send_probe_payload(payload)
 
-    async def _send_probe_payload(self, payload: str) -> None:
-        if await self.sender.send_message(payload):
+    async def _send_probe_payload(
+        self, payload: str, fallback: Optional[str] = None
+    ) -> None:
+        if await self.sender.send_message(payload, fallback_text=fallback):
             log.info("Startup probe sent to %s", self.config.target_chat_id)
         else:
             log.error(
@@ -383,55 +540,127 @@ class Application:
         if self.config.log_message_text:
             log.debug("Message %s text: %s", message.id, text)
 
-        result = self.filter.check(text)
+        source_chat_id = message.chat_id
+        try:
+            link = build_message_link(await event.get_chat(), message.id)
+        except Exception:  # noqa: BLE001 - ссылка необязательна
+            link = None
+
+        targets = await self._collect_targets()
+        if not targets:
+            log.info("Message %s: получателей нет", message.id)
+            return
+
+        entities = message_entities(message)
+        delivered = 0
+        for index, target in enumerate(targets):
+            if await self._deliver_to(
+                target, message, text, entities, source_chat_id, link
+            ):
+                delivered += 1
+            # Пауза нужна только на больших рассылках: отправки идут
+            # последовательно, а 429 и так обрабатывается в _call.
+            if len(targets) > FANOUT_PAUSE_AFTER and index + 1 < len(targets):
+                await asyncio.sleep(FANOUT_PAUSE)
+
+        log.info("Message %s: доставлено %s из %s получателей",
+                 message.id, delivered, len(targets))
+
+    async def _collect_targets(self) -> List["_Target"]:
+        """Получатель из .env плюс все одобренные пользователи со своими правилами."""
+        targets: List[_Target] = []
+
+        if self.config.legacy_delivery:
+            targets.append(_Target(
+                key=str(self.config.target_chat_id),
+                label=f"чат из .env ({self.config.target_chat_id})",
+                message_filter=self.filter,
+            ))
+
+        if not self.config.multi_user:
+            return targets
+
+        try:
+            recipients = await self.users.active_recipients()
+        except Exception as exc:  # noqa: BLE001 - сбой БД не должен ломать .env-доставку
+            log.exception("Не удалось прочитать список получателей: %s", exc)
+            return targets
+
+        for recipient in recipients:
+            if not recipient.settings.has_rules:
+                # Пустые правила = подписки нет. Иначе человек, только что
+                # получивший доступ, начал бы получать вообще всё подряд.
+                log.debug("Пользователь %s без правил — пропускаю",
+                          recipient.user.user_id)
+                continue
+            targets.append(_Target(
+                key=str(recipient.user.target_chat),
+                label=recipient.user.label,
+                message_filter=self.filter_for(recipient),
+                user_id=recipient.user.user_id,
+            ))
+        return targets
+
+    async def _deliver_to(
+        self,
+        target: "_Target",
+        message,
+        text: str,
+        entities,
+        source_chat_id: int,
+        link: Optional[str],
+    ) -> bool:
+        """Одна доставка. Никогда не бросает: сбой у одного не касается остальных."""
+        result = target.message_filter.check(text)
         if not result.matched:
-            log.info("Message %s ignored (%s)", message.id, result.reason)
-            return
+            log.debug("Message %s -> %s: %s", message.id, target.label, result.reason)
+            return False
 
-        chat_id = message.chat_id
-        if await self.store.is_processed(chat_id, message.id):
-            log.info("Message %s skipped: already processed", message.id)
-            return
+        if await self.store.is_delivered(source_chat_id, message.id, target.key):
+            log.info("Message %s -> %s: уже доставлено", message.id, target.label)
+            return False
 
-        log.info("Message %s matched %s", message.id, result.reason)
-
-        chat = await event.get_chat()
-        payload = format_message(
+        payload, fallback = format_message_with_fallback(
             source_label=self.source_label,
             sent_at=message.date,
             message_id=message.id,
             text=text,
+            entities=entities,
             reason=result.reason,
-            link=build_message_link(chat, message.id),
+            link=link,
         )
 
-        sent = await self.sender.send_message(payload)
-        if not sent:
-            # Не помечаем как обработанное: сообщение не доставлено.
-            log.error("Message %s NOT forwarded — запись в журнал не добавлена",
-                      message.id)
-            return
+        try:
+            await self.sender.deliver(target.key, payload)
+        except BotBlockedError as exc:
+            # Бот заблокирован, аккаунт удалён, Start не нажимали: повторять
+            # бессмысленно — снимаем с рассылки, пока человек не вернётся.
+            log.warning("Получатель %s недоступен (%s) — отключаю рассылку",
+                        target.label, exc)
+            if target.user_id is not None:
+                await self.users.set_blocked(target.user_id, True)
+                self.drop_filter_cache(target.user_id)
+            return False
+        except BotApiError as exc:
+            if _is_markup_failure(exc):
+                # Разметка не зашла — отправляем без неё, алерт важнее вида.
+                log.warning("Разметка отклонена для %s (%s) — шлю без неё",
+                            target.label, exc)
+                if not await self.sender.send_message(fallback, chat_id=target.key):
+                    return False
+            else:
+                log.error("Message %s -> %s не доставлено: %s",
+                          message.id, target.label, exc)
+                return False
+        except Exception as exc:  # noqa: BLE001 - один получатель не ломает остальных
+            log.error("Message %s -> %s не доставлено: %s",
+                      message.id, target.label, exc)
+            return False
 
-        await self.store.mark_processed(chat_id, message.id)
-        log.info("Message %s forwarded successfully", message.id)
-
-
-def _format_uptime(delta) -> str:
-    """'2 д 3 ч 4 мин' — без секунд, они в /info не нужны."""
-    total = int(delta.total_seconds())
-    if total < 60:
-        return "меньше минуты"
-    days, rest = divmod(total, 86400)
-    hours, rest = divmod(rest, 3600)
-    minutes = rest // 60
-    parts = []
-    if days:
-        parts.append(f"{days} д")
-    if hours:
-        parts.append(f"{hours} ч")
-    if minutes:
-        parts.append(f"{minutes} мин")
-    return " ".join(parts)
+        await self.store.mark_delivered(source_chat_id, message.id, target.key)
+        log.info("Message %s -> %s доставлено (%s)",
+                 message.id, target.label, result.reason)
+        return True
 
 
 # --------------------------------------------------------------------------- #

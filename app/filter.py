@@ -17,12 +17,19 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Optional, Pattern, Sequence
 
 from .config import Config
 
 log = logging.getLogger(__name__)
+
+# Режимы совпадения по ключевым словам:
+#   any   — достаточно одного слова (ИЛИ), как было всегда;
+#   all   — нужны все слова сразу (И);
+#   regex — слова игнорируются, решает только регулярное выражение.
+MODES = ("any", "all", "regex")
 
 
 @dataclass(frozen=True)
@@ -56,11 +63,14 @@ class MessageFilter:
         case_sensitive: bool = False,
         min_length: int = 0,
         max_length: int = 0,
+        mode: str = "any",
     ) -> None:
         self.case_sensitive = case_sensitive
         self.regex = regex
         self.min_length = min_length
         self.max_length = max_length
+        # Неизвестный режим не повод падать: откатываемся к прежнему поведению.
+        self.mode = mode if mode in MODES else "any"
 
         # Ключевые слова сравниваем в едином регистре, чтобы не звать
         # .lower() на каждое слово для каждого сообщения.
@@ -84,6 +94,39 @@ class MessageFilter:
             max_length=config.max_length,
         )
 
+    @classmethod
+    def from_settings(
+        cls,
+        *,
+        keywords: Sequence[str] = (),
+        exclude_keywords: Sequence[str] = (),
+        regex: str = "",
+        mode: str = "any",
+        case_sensitive: bool = False,
+        min_length: int = 0,
+        max_length: int = 0,
+    ) -> "MessageFilter":
+        """Собирает фильтр из значений SQLite (regex там хранится строкой).
+
+        Битый паттерн не роняет рассылку: он уже проверялся при /regex, а здесь
+        просто игнорируется — остальные правила пользователя продолжают работать.
+        """
+        compiled: Optional[Pattern[str]] = None
+        if regex:
+            try:
+                compiled = re.compile(regex, 0 if case_sensitive else re.IGNORECASE)
+            except re.error as exc:
+                log.warning("Некорректный regex пользователя пропущен: %s", exc)
+        return cls(
+            keywords=keywords,
+            exclude_keywords=exclude_keywords,
+            regex=compiled,
+            case_sensitive=case_sensitive,
+            min_length=min_length,
+            max_length=max_length,
+            mode=mode,
+        )
+
     @property
     def has_allow_rules(self) -> bool:
         return bool(self._keywords) or self.regex is not None
@@ -91,6 +134,8 @@ class MessageFilter:
     def describe(self) -> str:
         """Однострочное описание правил — пишется в лог при старте."""
         parts = []
+        if self.mode != "any":
+            parts.append(f"mode={self.mode}")
         parts.append(f"keywords={list(self._keywords_display) or 'any'}")
         if self._exclude_display:
             parts.append(f"exclude={list(self._exclude_display)}")
@@ -115,8 +160,22 @@ class MessageFilter:
         if length_problem is not None:
             return length_problem
 
+        if self.mode == "regex":
+            # Слова в этом режиме не участвуют вовсе.
+            if self.regex is None:
+                return FilterResult(False, "regex mode: pattern not set")
+            if self.regex.search(text):
+                return FilterResult(True, f"regex: {self.regex.pattern!r}")
+            return FilterResult(False, "no regex match")
+
         if not self.has_allow_rules:
             return FilterResult(True, "no allow rules configured: pass-through")
+
+        if self.mode == "all" and self._keywords:
+            missing = self._first_keyword_miss(text)
+            if missing is not None:
+                return FilterResult(False, f'missing keyword: "{missing}"')
+            return FilterResult(True, f"all keywords ({len(self._keywords)})")
 
         hit = self._first_keyword_hit(text)
         if hit is not None:
@@ -144,6 +203,14 @@ class MessageFilter:
             return FilterResult(False, f"too short: {length} < {self.min_length}")
         if self.max_length and length > self.max_length:
             return FilterResult(False, f"too long: {length} > {self.max_length}")
+        return None
+
+    def _first_keyword_miss(self, text: str) -> Optional[str]:
+        """Первое слово, которого в тексте нет. None — значит есть все."""
+        haystack = self._normalize(text)
+        for needle, display in zip(self._keywords, self._keywords_display):
+            if needle not in haystack:
+                return display
         return None
 
     def _first_keyword_hit(self, text: str) -> Optional[str]:

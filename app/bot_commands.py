@@ -1,11 +1,13 @@
-"""Обработка команд целевого бота (/info, /start).
+"""Приём команд целевого бота: long polling getUpdates.
 
-Отправка живёт в bot_sender.py, а здесь — приём: long polling getUpdates.
-Telethon не при делах, это второй, независимый канал через Bot API.
+Отправка живёт в bot_sender.py, а здесь — приём. Telethon не при делах,
+это второй, независимый канал через Bot API.
 
-Безопасность: бот отвечает ТОЛЬКО в целевой чат. Ответ на /info содержит
-настройки сервиса (аккаунт, правила, id чата), и посторонний, нашедший
-бота по имени, получить их не должен.
+Безопасность: слушатель сам ничего не решает. Кто имеет доступ, спрашивается
+у ``authorize`` (в проде — таблица users в SQLite), поэтому отозванный доступ
+действует немедленно, без перезапуска. Незнакомцу отвечают только публичные
+команды (/start, /help): посторонний, нашедший бота по имени, не должен даже
+узнать, какие команды существуют.
 """
 
 from __future__ import annotations
@@ -13,7 +15,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from typing import Any, Awaitable, Callable, Dict, Optional, Union
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, Union
 
 import aiohttp
 
@@ -21,10 +24,53 @@ from .bot_sender import BotApiError, BotSender
 
 log = logging.getLogger(__name__)
 
-Handler = Callable[[], Awaitable[str]]
-
 # Пауза после ошибки опроса: растёт до этого предела, чтобы не долбить API.
 MAX_BACKOFF = 60.0
+
+
+@dataclass(frozen=True)
+class CommandContext:
+    """Кто, откуда и с какими аргументами позвал команду."""
+
+    user_id: int
+    chat_id: int
+    username: str
+    full_name: str
+    args: str
+    is_admin: bool
+    # Заполнены только для нажатия инлайн-кнопки.
+    callback_id: Optional[str] = None
+    message_id: Optional[int] = None
+
+    @property
+    def label(self) -> str:
+        name = self.full_name or "без имени"
+        handle = f"@{self.username}" if self.username else "без username"
+        return f"{name} ({handle}, id={self.user_id})"
+
+
+@dataclass(frozen=True)
+class Access:
+    """Решение о доступе. Принимается снаружи, слушатель его только применяет."""
+
+    allowed: bool
+    is_admin: bool
+
+
+Handler = Callable[[CommandContext], Awaitable[Optional[str]]]
+Authorizer = Callable[[int], Awaitable[Access]]
+
+
+@dataclass(frozen=True)
+class _Registration:
+    handler: Handler
+    public: bool      # доступна всем, включая незнакомцев
+    admin_only: bool
+
+
+async def _allow_everything(_: int) -> Access:
+    """Поведение по умолчанию, если авторизатор не задан (тесты, одиночный режим)."""
+    return Access(allowed=True, is_admin=True)
 
 
 class CommandListener:
@@ -34,17 +80,34 @@ class CommandListener:
         self,
         sender: BotSender,
         *,
-        allowed_chat_id: Union[str, int],
+        authorize: Optional[Authorizer] = None,
+        owner_chat_id: Optional[Union[str, int]] = None,
         poll_timeout: int = 15,
     ) -> None:
         self.sender = sender
-        self.allowed_chat_id = str(allowed_chat_id)
+        self._authorize = authorize or _allow_everything
+        # Чат владельца из .env: полный доступ даже если БД пуста.
+        self.owner_chat_id = None if owner_chat_id is None else str(owner_chat_id)
         self.poll_timeout = poll_timeout
-        self._handlers: Dict[str, Handler] = {}
+        self._handlers: Dict[str, _Registration] = {}
+        self._callbacks: Dict[str, Handler] = {}
         self._offset: Optional[int] = None
 
-    def register(self, command: str, handler: Handler) -> None:
-        self._handlers[command.lstrip("/").lower()] = handler
+    def register(
+        self,
+        command: str,
+        handler: Handler,
+        *,
+        public: bool = False,
+        admin_only: bool = False,
+    ) -> None:
+        self._handlers[command.lstrip("/").lower()] = _Registration(
+            handler=handler, public=public, admin_only=admin_only
+        )
+
+    def register_callback(self, action: str, handler: Handler) -> None:
+        """Обработчик нажатия инлайн-кнопки с callback_data вида 'action:arg'."""
+        self._callbacks[action.lower()] = handler
 
     @property
     def commands(self) -> tuple:
@@ -60,9 +123,8 @@ class CommandListener:
         """
         await self._skip_backlog()
         log.info(
-            "Слушаю команды: %s (только чат %s)",
+            "Слушаю команды: %s",
             ", ".join("/" + name for name in self._handlers) or "нет",
-            self.allowed_chat_id,
         )
 
         attempt = 0
@@ -124,40 +186,145 @@ class CommandListener:
     # -- разбор апдейта ----------------------------------------------------- #
 
     async def _dispatch(self, update: Dict[str, Any]) -> None:
+        if update.get("callback_query"):
+            await self._dispatch_callback(update["callback_query"])
+            return
+
         message = update.get("message") or {}
-        chat_id = str((message.get("chat") or {}).get("id", ""))
         text = (message.get("text") or "").strip()
         if not text.startswith("/"):
             return
 
-        if chat_id != self.allowed_chat_id:
-            log.warning(
-                "Команда %r из чужого чата %s — игнорирую",
-                text.split()[0], chat_id or "?",
-            )
+        chat = message.get("chat") or {}
+        author = message.get("from") or {}
+        chat_id = chat.get("id")
+        if chat_id is None:
             return
 
-        name = self._parse_command(text)
-        handler = self._handlers.get(name)
-        if handler is None:
+        name, args = self._parse_command(text)
+        registration = self._handlers.get(name)
+        if registration is None:
             log.info("Неизвестная команда /%s", name)
             return
 
-        log.info("Команда /%s", name)
-        try:
-            reply = await handler()
-        except Exception as exc:  # noqa: BLE001 - команда не должна валить сервис
-            log.exception("Ошибка обработчика /%s: %s", name, exc)
+        access = await self._resolve_access(chat_id, author.get("id"))
+        if access is None:
+            return
+        if not self._permitted(registration, access):
+            log.warning("Команда /%s от %s отклонена: нет прав",
+                        name, author.get("id") or chat_id)
             return
 
-        if reply and not await self.sender.send_message(reply):
-            log.error("Ответ на /%s не доставлен", name)
+        ctx = self._context(chat_id, author, args, access)
+        log.info("Команда /%s от %s", name, ctx.user_id)
+        reply = await self._invoke(registration.handler, ctx, f"/{name}")
+        if reply and not await self.sender.send_message(reply, chat_id=ctx.chat_id):
+            log.error("Ответ на /%s не доставлен в чат %s", name, ctx.chat_id)
+
+    async def _dispatch_callback(self, query: Dict[str, Any]) -> None:
+        """Нажатие инлайн-кнопки: callback_data вида 'approve:12345'."""
+        data = (query.get("data") or "").strip()
+        author = query.get("from") or {}
+        message = query.get("message") or {}
+        chat_id = ((message.get("chat") or {}).get("id"))
+        callback_id = query.get("id")
+        if not data or chat_id is None:
+            return
+
+        action, _, args = data.partition(":")
+        handler = self._callbacks.get(action.lower())
+        if handler is None:
+            log.info("Неизвестное действие кнопки %r", action)
+            return
+
+        access = await self._resolve_access(chat_id, author.get("id"))
+        # Кнопки — только для админов: сама по себе callback_data ничего не
+        # доказывает, карточку могли переслать.
+        if access is None or not access.is_admin:
+            log.warning("Нажатие %r от не-админа %s — игнорирую",
+                        action, author.get("id"))
+            if callback_id:
+                await self.sender.answer_callback_query(
+                    callback_id, "Недостаточно прав"
+                )
+            return
+
+        ctx = self._context(
+            chat_id,
+            author,
+            args.strip(),
+            access,
+            callback_id=callback_id,
+            message_id=message.get("message_id"),
+        )
+        log.info("Кнопка %s от %s", action, ctx.user_id)
+        reply = await self._invoke(handler, ctx, f"кнопка {action}")
+        if reply and not await self.sender.send_message(reply, chat_id=ctx.chat_id):
+            log.error("Ответ на кнопку %s не доставлен", action)
+
+    async def _resolve_access(
+        self, chat_id: Any, user_id: Any
+    ) -> Optional[Access]:
+        """Права вызывающего. None — апдейт вообще не обрабатываем."""
+        # Чат владельца из .env — полный доступ, как до многопользовательского режима.
+        if self.owner_chat_id is not None and str(chat_id) == self.owner_chat_id:
+            return Access(allowed=True, is_admin=True)
+        if user_id is None:
+            return None  # сообщение без автора (пост в канале)
+        try:
+            return await self._authorize(int(user_id))
+        except Exception as exc:  # noqa: BLE001 - сбой БД не должен ронять опрос
+            log.exception("Не удалось проверить доступ для %s: %s", user_id, exc)
+            return None
 
     @staticmethod
-    def _parse_command(text: str) -> str:
-        """'/info@my_bot arg' -> 'info'."""
-        token = text.split()[0][1:]
-        return token.split("@", 1)[0].lower()
+    def _permitted(registration: _Registration, access: Access) -> bool:
+        if registration.admin_only:
+            return access.is_admin
+        return access.allowed or registration.public
+
+    @staticmethod
+    def _context(
+        chat_id: Any,
+        author: Dict[str, Any],
+        args: str,
+        access: Access,
+        *,
+        callback_id: Optional[str] = None,
+        message_id: Optional[int] = None,
+    ) -> CommandContext:
+        full_name = " ".join(
+            str(part)
+            for part in (author.get("first_name"), author.get("last_name"))
+            if part
+        )
+        return CommandContext(
+            user_id=int(author.get("id") or chat_id),
+            chat_id=int(chat_id),
+            username=str(author.get("username") or ""),
+            full_name=full_name,
+            args=args,
+            is_admin=access.is_admin,
+            callback_id=callback_id,
+            message_id=message_id,
+        )
+
+    async def _invoke(
+        self, handler: Handler, ctx: CommandContext, what: str
+    ) -> Optional[str]:
+        try:
+            return await handler(ctx)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - команда не должна валить сервис
+            log.exception("Ошибка обработчика %s: %s", what, exc)
+            return None
+
+    @staticmethod
+    def _parse_command(text: str) -> Tuple[str, str]:
+        """'/add@my_bot новое слово' -> ('add', 'новое слово')."""
+        head, _, rest = text.partition(" ")
+        return head[1:].split("@", 1)[0].lower(), rest.strip()
 
 
 def _backoff(attempt: int) -> float:

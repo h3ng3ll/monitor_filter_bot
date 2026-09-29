@@ -172,3 +172,69 @@ def test_format_message_fits_limit_with_escaping_heavy_text():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# --------------------------------------------------------------------------- #
+# Режимы совпадения
+# --------------------------------------------------------------------------- #
+
+def test_any_mode_is_the_default_and_unchanged():
+    f = MessageFilter(keywords=["April", "Natalie"])
+    assert f.mode == "any"
+    assert f.check("Team: April").matched is True
+
+
+def test_all_mode_requires_every_keyword():
+    f = MessageFilter(keywords=["April", "Sky"], mode="all")
+    assert f.check("Team: April, X Sky Whisper").matched is True
+
+    result = f.check("Team: April")
+    assert result.matched is False
+    assert 'missing keyword: "Sky"' == result.reason
+
+
+def test_all_mode_still_respects_exclude():
+    f = MessageFilter(keywords=["April"], exclude_keywords=["реклама"], mode="all")
+    assert f.check("April и реклама").matched is False
+
+
+def test_regex_mode_ignores_keywords():
+    f = MessageFilter.from_settings(
+        keywords=["April"], regex="Науменк", mode="regex"
+    )
+    assert f.check("Team: April").matched is False
+    assert f.check("White: Олександр Науменко").matched is True
+
+
+def test_regex_mode_without_pattern_matches_nothing():
+    f = MessageFilter(keywords=["April"], mode="regex")
+    result = f.check("Team: April")
+    assert result.matched is False
+    assert result.reason == "regex mode: pattern not set"
+
+
+def test_from_settings_ignores_broken_pattern():
+    # Битый паттерн не должен ронять рассылку остальным правилам.
+    f = MessageFilter.from_settings(keywords=["April"], regex="[unclosed")
+    assert f.regex is None
+    assert f.check("Team: April").matched is True
+
+
+def test_from_settings_regex_is_case_insensitive_by_default():
+    f = MessageFilter.from_settings(regex="науменк", mode="regex")
+    assert f.check("НАУМЕНКО").matched is True
+    sensitive = MessageFilter.from_settings(
+        regex="науменк", mode="regex", case_sensitive=True
+    )
+    assert sensitive.check("НАУМЕНКО").matched is False
+
+
+def test_unknown_mode_falls_back_to_any():
+    f = MessageFilter(keywords=["April"], mode="нечто")
+    assert f.mode == "any"
+    assert f.check("Team: April").matched is True
+
+
+def test_describe_mentions_non_default_mode():
+    assert "mode=all" in MessageFilter(keywords=["a"], mode="all").describe()
+    assert "mode=" not in MessageFilter(keywords=["a"]).describe()
