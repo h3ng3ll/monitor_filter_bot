@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import logging
 import signal
 import sys
@@ -50,7 +51,6 @@ from .telegram_client import (
     BotSessionError,
     NotAuthorizedError,
     SourceNotFoundError,
-    build_message_link,
     create_client,
     ensure_authorized,
     resolve_source,
@@ -73,6 +73,12 @@ EXIT_PERMANENT = 78  # EX_CONFIG из sysexits.h
 # лимита Bot API. Пауза включается только на больших рассылках.
 FANOUT_PAUSE = 0.05
 FANOUT_PAUSE_AFTER = 20
+
+# Источник меняет статус, редактируя своё же сообщение (In Review -> Rejected),
+# поэтому правка — отдельное уведомление со своим заголовком.
+def _text_hash(text: str) -> str:
+    """Отпечаток версии текста для журнала delivered_versions."""
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -461,20 +467,8 @@ class Application:
             )
         else:
             message, result = found
-            try:
-                chat = await message.get_chat()
-                link = build_message_link(chat, message.id)
-            except Exception:  # noqa: BLE001 - ссылка необязательна
-                link = None
-            payload, fallback = format_message_with_fallback(
-                header="✅ СЕРВИС ЗАПУЩЕН — последнее совпадение",
-                source_label=self.source_label,
-                sent_at=message.date,
-                message_id=message.id,
-                text=message.raw_text or "",
-                entities=message_entities(message),
-                reason=result.reason,
-                link=link,
+            payload, fallback = await self.history_payload(
+                message, result, header="✅ СЕРВИС ЗАПУЩЕН — последнее совпадение"
             )
             await self._send_probe_payload(payload, fallback)
             return
@@ -495,22 +489,42 @@ class Application:
 
     async def _find_last_match(self, limit: int):
         """Идёт по истории источника от новых к старым до первого совпадения."""
-        scanned = 0
+        found = await self.find_recent_matches(self.filter, count=1, limit=limit)
+        if not found:
+            log.info("Startup probe: совпадений нет среди последних %s сообщений",
+                     limit)
+            return None
+        message, result = found[0]
+        log.info("Startup probe: совпадение в сообщении %s (%s)",
+                 message.id, result.reason)
+        return message, result
+
+    async def find_recent_matches(
+        self, message_filter: MessageFilter, *, count: int, limit: int
+    ) -> List[Tuple[object, object]]:
+        """До count последних совпадений среди limit сообщений источника.
+
+        Порядок — от новых к старым. Сетевые ошибки Telethon (FloodWait,
+        RPCError, обрыв) пробрасываются: решать, что с ними делать, вызывающему.
+        """
+        found = []
         async for message in self.client.iter_messages(
             self.source_entity, limit=limit
         ):
-            scanned += 1
-            result = self.filter.check(message.raw_text or "")
+            result = message_filter.check(message.raw_text or "")
             if result.matched:
-                log.info(
-                    "Startup probe: совпадение в сообщении %s (%s), просмотрено %s",
-                    message.id, result.reason, scanned,
-                )
-                return message, result
+                found.append((message, result))
+                if len(found) >= count:
+                    break
+        return found
 
-        log.info("Startup probe: совпадений нет среди последних %s сообщений",
-                 scanned)
-        return None
+    async def history_payload(self, message, result, *, header: str) -> Tuple[str, str]:
+        """Уведомление по сообщению из истории: пара «с разметкой, без неё»."""
+        return format_message_with_fallback(
+            header=header,
+            text=message.raw_text or "",
+            entities=message_entities(message),
+        )
 
     # -- обработка сообщений ------------------------------------------------ #
 
@@ -520,11 +534,23 @@ class Application:
             self._on_new_message,
             events.NewMessage(from_users=self.source_entity, incoming=True),
         )
+        # Без этого правки источника (смена статуса на Rejected и т.п.)
+        # не доходили бы вовсе: новое сообщение он при этом не присылает.
+        self.client.add_event_handler(
+            self._on_edited_message,
+            events.MessageEdited(from_users=self.source_entity, incoming=True),
+        )
 
     async def _on_new_message(self, event: events.NewMessage.Event) -> None:
-        """Обрабатывает одно новое сообщение. Никогда не бросает наружу."""
+        await self._safe_handle(event, edited=False)
+
+    async def _on_edited_message(self, event: events.MessageEdited.Event) -> None:
+        await self._safe_handle(event, edited=True)
+
+    async def _safe_handle(self, event, *, edited: bool) -> None:
+        """Обрабатывает одно событие. Никогда не бросает наружу."""
         try:
-            await self._handle(event)
+            await self._handle(event, edited=edited)
         except tg_errors.FloodWaitError as exc:
             wait_for = min(exc.seconds + 5, self.config.flood_wait_max_seconds)
             log.warning("FloodWait %s c при обработке сообщения — жду", exc.seconds)
@@ -532,7 +558,7 @@ class Application:
         except Exception as exc:  # noqa: BLE001 - один сбой не должен убить сервис
             log.exception("Необработанная ошибка при обработке сообщения: %s", exc)
 
-    async def _handle(self, event: events.NewMessage.Event) -> None:
+    async def _handle(self, event, *, edited: bool = False) -> None:
         message = event.message
 
         # Подстраховка: from_users уже отфильтровал, но проверяем явно.
@@ -542,8 +568,9 @@ class Application:
 
         text = message.raw_text or ""
         log.info(
-            "Message %s from %s at %s (len=%s)",
+            "Message %s %sfrom %s at %s (len=%s)",
             message.id,
+            "edited " if edited else "",
             self.source_label,
             message.date.isoformat() if message.date else "?",
             len(text),
@@ -552,10 +579,6 @@ class Application:
             log.debug("Message %s text: %s", message.id, text)
 
         source_chat_id = message.chat_id
-        try:
-            link = build_message_link(await event.get_chat(), message.id)
-        except Exception:  # noqa: BLE001 - ссылка необязательна
-            link = None
 
         targets = await self._collect_targets()
         if not targets:
@@ -566,7 +589,8 @@ class Application:
         delivered = 0
         for index, target in enumerate(targets):
             if await self._deliver_to(
-                target, message, text, entities, source_chat_id, link
+                target, message, text, entities, source_chat_id,
+                edited=edited,
             ):
                 delivered += 1
             # Пауза нужна только на больших рассылках: отправки идут
@@ -647,26 +671,35 @@ class Application:
         text: str,
         entities,
         source_chat_id: int,
-        link: Optional[str],
+        *,
+        edited: bool = False,
     ) -> bool:
-        """Одна доставка. Никогда не бросает: сбой у одного не касается остальных."""
+        """Одна доставка. Никогда не бросает: сбой у одного не касается остальных.
+
+        Новое сообщение уходит получателю один раз. Правка — по одному разу на
+        каждую версию текста: Telegram шлёт MessageEdited и при смене кнопок
+        или превью ссылки, и такой «пустой» правке повторяться незачем.
+        """
         result = target.message_filter.check(text)
         if not result.matched:
             log.debug("Message %s -> %s: %s", message.id, target.label, result.reason)
             return False
 
-        if await self.store.is_delivered(source_chat_id, message.id, target.key):
+        text_hash = _text_hash(text)
+        if edited:
+            already = await self.store.is_version_delivered(
+                source_chat_id, message.id, target.key, text_hash
+            )
+        else:
+            already = await self.store.is_delivered(
+                source_chat_id, message.id, target.key
+            )
+        if already:
             log.info("Message %s -> %s: уже доставлено", message.id, target.label)
             return False
 
         payload, fallback = format_message_with_fallback(
-            source_label=self.source_label,
-            sent_at=message.date,
-            message_id=message.id,
-            text=text,
-            entities=entities,
-            reason=result.reason,
-            link=link,
+            text=text, entities=entities
         )
 
         try:
@@ -697,8 +730,12 @@ class Application:
             return False
 
         await self.store.mark_delivered(source_chat_id, message.id, target.key)
-        log.info("Message %s -> %s доставлено (%s)",
-                 message.id, target.label, result.reason)
+        await self.store.mark_version_delivered(
+            source_chat_id, message.id, target.key, text_hash
+        )
+        log.info("Message %s -> %s доставлено%s (%s)",
+                 message.id, target.label, " (правка)" if edited else "",
+                 result.reason)
         return True
 
 
@@ -758,13 +795,7 @@ def run_check_filter(config: Config, text: str) -> int:
     if result.matched:
         print("\n--- так будет выглядеть уведомление ---")
         print(
-            format_message(
-                source_label=config.source_label,
-                sent_at=None,
-                message_id=0,
-                text=text,
-                reason=result.reason,
-            )
+            format_message(text=text)
         )
     return 0 if result.matched else 1
 

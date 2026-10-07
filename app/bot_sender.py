@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from datetime import datetime
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import aiohttp
@@ -92,54 +91,30 @@ def _matches(description: str, markers: Sequence[str]) -> bool:
 
 def format_message(
     *,
-    source_label: str,
-    sent_at: Optional[datetime],
-    message_id: int,
     text: str,
     entities: Optional[Sequence[Any]] = None,
-    reason: Optional[str] = None,
-    link: Optional[str] = None,
-    header: str = "🚨 ВАЖНОЕ СООБЩЕНИЕ",
+    header: Optional[str] = None,
     max_length: int = TELEGRAM_MAX_TEXT,
 ) -> str:
-    """Собирает готовое HTML-уведомление.
+    """Собирает готовое HTML-уведомление — копию исходного сообщения.
 
     ``entities`` — разметка исходного сообщения (Telethon). Если она передана,
     копия воспроизводит оформление оригинала: ссылки остаются ссылками. Всё,
     что не попало в известные сущности, экранируется, поэтому символы вроде
     ``<`` или ``&`` из исходного сообщения разметку не ломают.
-    Без ``entities`` результат такой же, как был до появления этой поддержки.
 
-    Ссылка добавляется, только если она реально существует (``link is not None``) —
-    выдуманные ссылки не строятся.
+    ``header`` нужен только служебным сообщениям (стартовая проверка, /last):
+    обычный алерт приходит без обёртки, как дубликат оригинала.
     """
-    when = _format_datetime(sent_at)
+    head = f"<b>{escape_html(header)}</b>\n\n" if header else ""
 
-    head_lines = [
-        f"<b>{escape_html(header)}</b>",
-        "",
-        f"<b>Источник:</b> {escape_html(source_label)}",
-        f"<b>Время:</b> {escape_html(when)}",
-    ]
-    if reason:
-        head_lines.append(f"<b>Причина:</b> {escape_html(reason)}")
-    head_lines.append("")
-    head_lines.append("<b>Текст:</b>")
-
-    tail_lines = ["", f"<b>ID:</b> {message_id}"]
-    if link:
-        tail_lines.append(f'🔗 <a href="{escape_html(link)}">Открыть оригинал</a>')
-
-    head = "\n".join(head_lines)
-    tail = "\n".join(tail_lines)
-
-    body_budget = max_length - len(head) - len(tail) - 2  # 2 переноса строки
+    body_budget = max_length - len(head)
     if text:
         body = render_body(text, entities, budget=body_budget)
     else:
         body = escape_html("(без текста)")
 
-    return f"{head}\n{body}\n{tail}"
+    return f"{head}{body}"
 
 
 def format_message_with_fallback(**kwargs: Any) -> Tuple[str, str]:
@@ -174,16 +149,6 @@ def format_status(
         lines.append("")
         lines.append(escape_html(note))
     return "\n".join(lines)[:max_length]
-
-
-def _format_datetime(value: Optional[datetime]) -> str:
-    if value is None:
-        return "неизвестно"
-    try:
-        local = value.astimezone()  # переводим UTC из Telegram в локальное время Pi
-    except (ValueError, OSError):
-        local = value
-    return local.strftime("%Y-%m-%d %H:%M:%S %Z").strip()
 
 
 # --------------------------------------------------------------------------- #

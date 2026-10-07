@@ -174,6 +174,61 @@ def test_new_user_still_gets_an_already_delivered_message(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Правки сообщений источника
+# --------------------------------------------------------------------------- #
+
+IN_REVIEW = "🔍 Propes — App Store review: In Review. White: Науменко"
+REJECTED = "⛔ Propes — App Store review: Rejected. White: Науменко"
+
+
+def _edit(app, text, message_id=5):
+    _run(app._handle(_FakeEvent(_message(message_id, text)), edited=True))
+
+
+def test_edit_with_new_text_is_delivered_as_plain_copy(tmp_path):
+    app = _app(tmp_path, legacy=False)
+    _add_user(app, 1, ["Науменко"])
+    _handle(app, _message(text=IN_REVIEW))
+    _edit(app, REJECTED)
+    assert app.sender.recipients == ["1", "1"]
+    assert "Rejected" in app.sender.delivered[1][1]
+    assert "ОБНОВЛЕНО" not in app.sender.delivered[1][1]
+
+
+def test_same_edit_twice_is_delivered_once(tmp_path):
+    app = _app(tmp_path, legacy=False)
+    _add_user(app, 1, ["Науменко"])
+    _handle(app, _message(text=IN_REVIEW))
+    _edit(app, REJECTED)
+    _edit(app, REJECTED)
+    assert app.sender.recipients == ["1", "1"]
+
+
+def test_edit_with_unchanged_text_is_not_delivered(tmp_path):
+    app = _app(tmp_path, legacy=False)
+    _add_user(app, 1, ["Науменко"])
+    _handle(app, _message(text=IN_REVIEW))
+    _edit(app, IN_REVIEW)  # например, сменились только кнопки
+    assert app.sender.recipients == ["1"]
+
+
+def test_edit_reaches_user_who_skipped_the_original(tmp_path):
+    app = _app(tmp_path, legacy=False)
+    _add_user(app, 1, ["Rejected"])
+    _handle(app, _message(text=IN_REVIEW))
+    _edit(app, REJECTED)
+    assert app.sender.recipients == ["1"]
+
+
+def test_non_matching_edit_is_not_delivered(tmp_path):
+    app = _app(tmp_path, legacy=False)
+    _add_user(app, 1, ["Науменко"])
+    _handle(app, _message(text=IN_REVIEW))
+    _edit(app, "⛔ Propes — Rejected. White: кто-то другой")
+    assert app.sender.recipients == ["1"]
+
+
+# --------------------------------------------------------------------------- #
 # Сбои доставки
 # --------------------------------------------------------------------------- #
 

@@ -52,8 +52,31 @@ class FakeSender:
         return [text for target, text in self.delivered if target == str(chat_id)]
 
 
+class FakeClient:
+    """История источника для /last: список от новых к старым."""
+
+    def __init__(self, texts=()):
+        self.messages = [
+            SimpleNamespace(id=100 - i, raw_text=text, date=None, entities=None,
+                            get_chat=self._chat)
+            for i, text in enumerate(texts)
+        ]
+
+    @staticmethod
+    async def _chat():
+        return SimpleNamespace()
+
+    def iter_messages(self, entity, limit=None):
+        async def gen():
+            for message in self.messages[:limit]:
+                yield message
+        return gen()
+
+
 def _app(tmp_path):
     app = Application.__new__(Application)
+    app.client = FakeClient()
+    app.source_entity = object()
     app.config = SimpleNamespace(
         target_chat_id=OWNER,
         legacy_delivery=False,
@@ -100,6 +123,60 @@ def _join(app, user_id, keywords=("Науменко",)):
     _run(app.handlers.cmd_approve(_admin(str(user_id))))
     for word in keywords:
         _run(app.handlers.cmd_add(_ctx(user_id, args=word)))
+
+
+# --------------------------------------------------------------------------- #
+# /last — совпадения из истории
+# --------------------------------------------------------------------------- #
+
+HISTORY = ["Rejected. White: Науменко", "чужое", "In Review. White: Науменко",
+           "Approved. White: Науменко"]
+
+
+def test_last_sends_newest_match_by_default(tmp_path):
+    app = _app(tmp_path)
+    app.client = FakeClient(HISTORY)
+    reply = _run(app.handlers.cmd_last(_admin()))
+    sent = app.sender.texts_to(OWNER)
+    assert len(sent) == 1 and "Rejected" in sent[0] and "ТЕСТ" in sent[0]
+    assert "1 из 1" in reply and "правила из .env" in reply
+    # Это диагностика: в журнал доставок ничего не попадает.
+    assert _run(app.store.count()) == 0
+
+
+def test_last_sends_n_matches_oldest_first(tmp_path):
+    app = _app(tmp_path)
+    app.client = FakeClient(HISTORY)
+    _run(app.handlers.cmd_last(_admin("2")))
+    sent = app.sender.texts_to(OWNER)
+    assert len(sent) == 2
+    assert "In Review" in sent[0] and "Rejected" in sent[1]
+
+
+def test_last_uses_admin_personal_rules_when_set(tmp_path):
+    app = _app(tmp_path)
+    app.client = FakeClient(HISTORY)
+    _run(app.handlers.cmd_add(_admin("Approved")))
+    reply = _run(app.handlers.cmd_last(_admin("5")))
+    sent = app.sender.texts_to(OWNER)
+    assert len(sent) == 1 and "Approved" in sent[0]
+    assert "ваши правила" in reply
+
+
+def test_last_reports_no_matches_and_bad_argument(tmp_path):
+    app = _app(tmp_path)
+    app.client = FakeClient(["чужое"])
+    assert "совпадений нет" in _run(app.handlers.cmd_last(_admin()))
+    assert "Укажите число" in _run(app.handlers.cmd_last(_admin("abc")))
+    assert app.sender.texts_to(OWNER) == []
+
+
+def test_last_is_admin_only(tmp_path):
+    app = _app(tmp_path)
+    listener = CommandListener(app.sender, authorize=app._authorize,
+                               owner_chat_id=OWNER)
+    app.handlers.register_all(listener)
+    assert listener._handlers["last"].admin_only is True
 
 
 # --------------------------------------------------------------------------- #

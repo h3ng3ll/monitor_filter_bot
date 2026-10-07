@@ -60,6 +60,9 @@ def _probe(texts, **filter_kwargs):
         filter=MessageFilter(**filter_kwargs),
         source_entity=object(),
     )
+    app.find_recent_matches = (
+        lambda *args, **kwargs: Application.find_recent_matches(app, *args, **kwargs)
+    )
     found = asyncio.run(Application._find_last_match(app, len(texts)))
     return found, seen
 

@@ -56,6 +56,20 @@ CREATE INDEX IF NOT EXISTS idx_deliveries_at
     ON deliveries (delivered_at);
 CREATE INDEX IF NOT EXISTS idx_deliveries_recipient
     ON deliveries (recipient);
+
+-- Версии текста, уже ушедшие получателю. Источник меняет статус, редактируя
+-- старое сообщение (In Review -> Rejected), поэтому id сообщения не говорит,
+-- видел ли человек новый текст. text_hash — sha1 текста этой версии.
+CREATE TABLE IF NOT EXISTS delivered_versions (
+    source_chat_id INTEGER NOT NULL,
+    message_id     INTEGER NOT NULL,
+    recipient      TEXT    NOT NULL,
+    text_hash      TEXT    NOT NULL,
+    delivered_at   TEXT    NOT NULL,
+    PRIMARY KEY (source_chat_id, message_id, recipient, text_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_versions_at
+    ON delivered_versions (delivered_at);
 """
 
 
@@ -179,6 +193,48 @@ class ProcessedMessageStore:
             )
             conn.commit()
 
+    async def is_version_delivered(
+        self, source_chat_id: int, message_id: int, recipient: str, text_hash: str
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._is_version_delivered_sync,
+            source_chat_id, message_id, recipient, text_hash,
+        )
+
+    def _is_version_delivered_sync(
+        self, source_chat_id: int, message_id: int, recipient: str, text_hash: str
+    ) -> bool:
+        with self._lock:
+            cur = self._require_conn().execute(
+                "SELECT 1 FROM delivered_versions "
+                "WHERE source_chat_id = ? AND message_id = ? AND recipient = ? "
+                "AND text_hash = ?",
+                (source_chat_id, message_id, str(recipient), text_hash),
+            )
+            return cur.fetchone() is not None
+
+    async def mark_version_delivered(
+        self, source_chat_id: int, message_id: int, recipient: str, text_hash: str
+    ) -> None:
+        await asyncio.to_thread(
+            self._mark_version_delivered_sync,
+            source_chat_id, message_id, recipient, text_hash,
+        )
+
+    def _mark_version_delivered_sync(
+        self, source_chat_id: int, message_id: int, recipient: str, text_hash: str
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self._lock:
+            conn = self._require_conn()
+            conn.execute(
+                "INSERT OR IGNORE INTO delivered_versions "
+                "(source_chat_id, message_id, recipient, text_hash, delivered_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (source_chat_id, message_id, str(recipient), text_hash, now),
+            )
+            conn.commit()
+
     async def prune(self) -> int:
         """Удаляет записи старше retention_days. Возвращает число удалённых."""
         if not self.retention_days:
@@ -194,6 +250,7 @@ class ProcessedMessageStore:
             removed = 0
             for statement in (
                 "DELETE FROM deliveries WHERE delivered_at < ?",
+                "DELETE FROM delivered_versions WHERE delivered_at < ?",
                 "DELETE FROM processed_messages WHERE processed_at < ?",
             ):
                 cur = conn.execute(statement, (cutoff,))

@@ -10,8 +10,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
+
+from telethon import errors as tg_errors
 
 from .bot_commands import CommandContext, CommandListener, Handler
 from .bot_sender import escape_html, format_status
@@ -45,6 +48,10 @@ PUBLIC_MENU = [
 # Сколько карточек с кнопками отправляем за один /users.
 MAX_CARDS = 15
 
+# /last: сколько совпадений можно запросить за раз и сколько истории смотреть.
+MAX_LAST = 10
+LAST_SCAN_LIMIT = 200
+
 _MODE_EXPLANATION = {
     "any": "подходит любое из ключевых слов (или regex)",
     "all": "должны встретиться все ключевые слова",
@@ -75,6 +82,7 @@ ADMIN_HELP = (
     "/unblock &lt;id&gt; — вернуть доступ (обратное к /revoke)\n"
     "/forget &lt;id&gt; — удалить пользователя целиком\n"
     "/denyall — отклонить все заявки\n"
+    "/last [N] — прислать N последних совпадений из истории источника\n"
     "/info — настройки и состояние сервиса"
 )
 
@@ -159,6 +167,7 @@ class BotHandlers:
         listener.register("revoke", self.cmd_revoke, admin_only=True)
         listener.register("unblock", self.cmd_unblock, admin_only=True)
         listener.register("forget", self.cmd_forget, admin_only=True)
+        listener.register("last", self.cmd_last, admin_only=True)
 
         listener.register_callback("approve", self.cb_approve)
         listener.register_callback("deny", self.cb_deny)
@@ -415,6 +424,52 @@ class BotHandlers:
         # ctx не нужен, но сигнатура у всех обработчиков одна — так их можно
         # регистрировать единообразно.
         return await self.app.describe_service()
+
+    async def cmd_last(self, ctx: CommandContext) -> str:
+        """Проверка фильтра на живых данных: последние совпадения из истории.
+
+        Правила — личные правила админа, а если их нет — правила из .env.
+        В журнал доставок ничего не пишется: это диагностика, не рассылка.
+        """
+        raw = ctx.args.strip()
+        if raw and not raw.isdigit():
+            return f"Укажите число: /last 3 (от 1 до {MAX_LAST})"
+        count = min(max(int(raw or 1), 1), MAX_LAST)
+
+        settings = await self.users.settings(ctx.user_id)
+        if settings.has_rules:
+            message_filter, rules = self.app.build_filter(settings), "ваши правила"
+        else:
+            message_filter, rules = self.app.filter, "правила из .env"
+
+        try:
+            found = await self.app.find_recent_matches(
+                message_filter, count=count, limit=LAST_SCAN_LIMIT
+            )
+        except tg_errors.FloodWaitError as exc:
+            return f"Telegram просит подождать {exc.seconds} c. Повторите позже."
+        except (ConnectionError, OSError, asyncio.TimeoutError,
+                tg_errors.RPCError, ValueError) as exc:
+            log.warning("/last: история недоступна (%s: %s)",
+                        type(exc).__name__, exc)
+            return f"Не удалось прочитать историю: {escape_html(str(exc))}"
+
+        if not found:
+            return (f"Среди последних {LAST_SCAN_LIMIT} сообщений источника "
+                    f"совпадений нет ({rules}).")
+
+        sent = 0
+        # От старых к новым: самое свежее окажется внизу чата.
+        for message, result in reversed(found):
+            payload, fallback = await self.app.history_payload(
+                message, result, header="🧪 ТЕСТ — совпадение из истории"
+            )
+            if await self.sender.send_message(
+                payload, chat_id=ctx.chat_id, fallback_text=fallback
+            ):
+                sent += 1
+        return (f"Отправлено совпадений: {sent} из {len(found)} "
+                f"({rules}, просмотрено до {LAST_SCAN_LIMIT} сообщений).")
 
     async def cmd_pending(self, ctx: CommandContext) -> Optional[str]:
         pending = await self.users.list_by_status(STATUS_PENDING)

@@ -55,6 +55,28 @@ def test_count_for_recipient(tmp_path):
     assert _run(store.count_for("bob")) == 1
 
 
+def test_versions_are_tracked_per_text_hash(tmp_path):
+    store = _store(tmp_path)
+    assert _run(store.is_version_delivered(-100, 5, "alice", "h1")) is False
+    _run(store.mark_version_delivered(-100, 5, "alice", "h1"))
+    _run(store.mark_version_delivered(-100, 5, "alice", "h1"))
+    assert _run(store.is_version_delivered(-100, 5, "alice", "h1")) is True
+    assert _run(store.is_version_delivered(-100, 5, "alice", "h2")) is False
+    assert _run(store.is_version_delivered(-100, 5, "bob", "h1")) is False
+    # Версии не считаются отдельными доставками в /info.
+    assert _run(store.count()) == 0
+
+
+def test_prune_removes_old_versions(tmp_path):
+    store = _store(tmp_path, retention_days=1)
+    _run(store.mark_version_delivered(-100, 5, "alice", "h1"))
+    conn = store._require_conn()
+    conn.execute("UPDATE delivered_versions SET delivered_at = '2000-01-01T00:00:00+00:00'")
+    conn.commit()
+    assert _run(store.prune()) == 1
+    assert _run(store.is_version_delivered(-100, 5, "alice", "h1")) is False
+
+
 def test_recipient_key_accepts_channel_username(tmp_path):
     # TARGET_CHAT_ID может быть строкой @name, а не числом.
     store = _store(tmp_path)

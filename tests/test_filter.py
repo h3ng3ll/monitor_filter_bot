@@ -120,53 +120,31 @@ def test_escape_html():
 
 
 def test_format_message_escapes_user_text():
-    out = format_message(
-        source_label="@some_bot",
-        sent_at=None,
-        message_id=12345,
-        text="<script>alert(1)</script> & co",
-        reason='keyword: "критично"',
-    )
+    out = format_message(text="<script>alert(1)</script> & co")
     assert "<script>" not in out
     assert "&lt;script&gt;" in out
-    assert "<b>ID:</b> 12345" in out
-    assert "@some_bot" in out
 
 
-def test_format_message_adds_link_only_when_given():
-    without = format_message(
-        source_label="@some_bot", sent_at=None, message_id=1, text="привет"
-    )
-    assert "Открыть оригинал" not in without
+def test_format_message_is_plain_copy_without_envelope():
+    out = format_message(text="привет")
+    assert out == "привет"
+    for noise in ("ВАЖНОЕ", "Источник", "Время", "Причина", "ID:"):
+        assert noise not in out
 
-    with_link = format_message(
-        source_label="@some_bot",
-        sent_at=None,
-        message_id=1,
-        text="привет",
-        link="https://t.me/c/123/1",
-    )
-    assert 'href="https://t.me/c/123/1"' in with_link
+
+def test_format_message_header_only_when_given():
+    out = format_message(text="привет", header="✅ СЕРВИС ЗАПУЩЕН")
+    assert out == "<b>✅ СЕРВИС ЗАПУЩЕН</b>\n\nпривет"
 
 
 def test_format_message_fits_telegram_limit():
-    out = format_message(
-        source_label="@some_bot",
-        sent_at=None,
-        message_id=1,
-        text="A" * 10000,
-    )
+    out = format_message(text="A" * 10000)
     assert len(out) <= 4096
     assert "обрезано" in out
 
 
 def test_format_message_fits_limit_with_escaping_heavy_text():
-    out = format_message(
-        source_label="@some_bot",
-        sent_at=None,
-        message_id=1,
-        text="<&>" * 4000,
-    )
+    out = format_message(text="<&>" * 4000)
     assert len(out) <= 4096
 
 

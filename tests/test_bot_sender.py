@@ -123,12 +123,7 @@ def test_blocked_error_is_a_bot_api_error():
 # --------------------------------------------------------------------------- #
 
 def _kwargs(**extra):
-    base = dict(
-        source_label="@src",
-        sent_at=None,
-        message_id=7,
-        text="Open link here",
-    )
+    base = dict(text="Open link here")
     base.update(extra)
     return base
 
@@ -160,8 +155,7 @@ def test_format_message_with_entities_fits_telegram_limit():
     assert out.count("<b>") == out.count("</b>")
 
 
-def test_format_message_preserves_entities_and_envelope():
+def test_format_message_preserves_entities():
     entities = [tl.MessageEntityTextUrl(offset=5, length=4, url="https://x.example")]
-    out = format_message(**_kwargs(entities=entities, reason='keyword: "x"'))
-    assert 'href="https://x.example"' in out
-    assert "<b>ID:</b> 7" in out
+    out = format_message(**_kwargs(entities=entities))
+    assert out == 'Open <a href="https://x.example">link</a> here'
